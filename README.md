@@ -1,6 +1,6 @@
 # cosyvoice-win-jobs
 
-Minimal polling jobs server for **CosyVoice2** on a Windows host.
+Minimal polling jobs server for **CosyVoice2/CosyVoice3** on a Windows host.
 
 This repo is deliberately narrow. It is meant for one job:
 
@@ -50,7 +50,8 @@ For a Windows machine with **RTX 3070 Ti 8GB**, the most realistic first deploym
 
 - Windows host
 - WSL2 Ubuntu recommended for the actual model runtime
-- `CosyVoice2-0.5B`
+- `Fun-CosyVoice3-0.5B` for Russian audiobook work
+- `CosyVoice2-0.5B` as the older fallback
 - `fp16=true`
 - `load_vllm=false`
 - `load_trt=false`
@@ -62,6 +63,7 @@ Current native Windows smoke status:
 
 - tested with local Miniforge under `.conda/miniforge`
 - tested with `FunAudioLLM/CosyVoice2-0.5B`
+- tested with `FunAudioLLM/Fun-CosyVoice3-0.5B`
 - tested with CUDA on RTX 3070 Ti
 - CLI zero-shot synthesis works with UTF-8 Russian text files
 - polling jobs API works on `127.0.0.1:8040`
@@ -109,7 +111,7 @@ That cache-first behavior is the main quality lever for chunk-to-chunk consisten
 POST /v1/tts/jobs
 {
   "input": "Это тестовая фраза.",
-  "model": "CosyVoice2-0.5B",
+  "model": "Fun-CosyVoice3-0.5B",
   "voice": "reference_long",
   "response_format": "wav",
   "mode": "zero_shot",
@@ -124,7 +126,7 @@ POST /v1/tts/jobs
 POST /v1/tts/jobs
 {
   "input": "Это тестовая фраза.",
-  "model": "CosyVoice2-0.5B",
+  "model": "Fun-CosyVoice3-0.5B",
   "voice": "reference_long",
   "response_format": "wav",
   "mode": "zero_shot",
@@ -236,7 +238,7 @@ Typical settings on that side would look like:
 tts = openai
 voice_name = reference_long
 output_format = wav
-model_name = CosyVoice2-0.5B
+model_name = Fun-CosyVoice3-0.5B
 speed = 1.0
 
 [tts.openai]
@@ -255,6 +257,8 @@ openai_submit_extra_fields = {"mode":"zero_shot","text_frontend":false}
 
 If the voice cache already exists on the server, `voice_name` alone is enough. If not, you first seed the cache with a shared `voice.wav + voice.txt` pair or a request that includes uploaded reference audio and `reference_text`.
 
+For CosyVoice3 the wrapper automatically adds the required `<|endofprompt|>` marker to prompt/instruction text before calling the official runtime.
+
 ## Installation idea
 
 This wrapper expects the official CosyVoice codebase to be available under `vendor/CosyVoice/`.
@@ -268,17 +272,21 @@ The included bootstrap script is designed to:
 
 On Windows the wrapper scripts first look for a repo-local conda executable at `.conda/miniforge/Scripts/conda.exe`, then fall back to `conda` from `PATH`.
 
-If ModelScope downloads fail because of local SSL certificates, downloading `FunAudioLLM/CosyVoice2-0.5B` from Hugging Face into `pretrained_models/CosyVoice2-0.5B` is a valid fallback.
+If ModelScope downloads fail because of local SSL certificates, downloading from Hugging Face is a valid fallback:
+
+- `FunAudioLLM/Fun-CosyVoice3-0.5B` into `pretrained_models/Fun-CosyVoice3-0.5B`
+- `FunAudioLLM/CosyVoice2-0.5B` into `pretrained_models/CosyVoice2-0.5B`
 
 Model weights are not committed. Put them under:
 
+- `pretrained_models/Fun-CosyVoice3-0.5B`
 - `pretrained_models/CosyVoice2-0.5B`
 
 ## Quick Start
 
 ```cmd
 scripts\bootstrap_windows.cmd
-cosyvoice-win-server.cmd --host 127.0.0.1 --port 8040
+cosyvoice-win-server.cmd --host 127.0.0.1 --port 8040 --model-id Fun-CosyVoice3-0.5B --model-dir pretrained_models\Fun-CosyVoice3-0.5B
 ```
 
 Then place a reference bundle into `shared/` and submit a job.

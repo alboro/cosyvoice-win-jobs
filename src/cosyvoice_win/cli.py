@@ -24,6 +24,8 @@ DEFAULT_SPEED = 1.0
 DEFAULT_TEXT_FRONTEND = False
 DEFAULT_FP16 = True
 DEFAULT_STREAM = False
+COSYVOICE3_PROMPT_PREFIX = "You are a helpful assistant.<|endofprompt|>"
+COSYVOICE3_PROMPT_MARKER = "<|endofprompt|>"
 
 REFERENCE_AUDIO_EXTENSIONS = {
     ".wav",
@@ -72,6 +74,7 @@ class CosyVoiceSynthesisOptions:
     text_frontend: bool = DEFAULT_TEXT_FRONTEND
     speed: float = DEFAULT_SPEED
     stream: bool = DEFAULT_STREAM
+    instruct_text: str | None = None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -107,7 +110,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reference-text-file", default=None, help="File containing the reference transcript.")
     parser.add_argument("--model-dir", default=str(DEFAULT_MODEL_DIR))
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
-    parser.add_argument("--mode", choices=("zero_shot", "cross_lingual"), default=DEFAULT_MODE)
+    parser.add_argument("--mode", choices=("zero_shot", "cross_lingual", "instruct2"), default=DEFAULT_MODE)
+    parser.add_argument("--instruct-text", default=None, help="Instruction text for CosyVoice2 instruct2 mode.")
     parser.add_argument("--text-frontend", choices=("on", "off"), default="off")
     parser.add_argument("--speed", type=float, default=DEFAULT_SPEED)
     parser.add_argument("--fp16", choices=("on", "off"), default="on" if DEFAULT_FP16 else "off")
@@ -371,14 +375,27 @@ def maybe_disable_text_frontend_imports(text_frontend: bool):
 
 def load_model(model_options: CosyVoiceModelOptions):
     AutoModel, _ = load_cosyvoice_runtime()
+    model_kwargs = build_model_kwargs(model_options)
     with maybe_disable_text_frontend_imports(model_options.text_frontend):
-        return AutoModel(
-            model_dir=str(model_options.model_dir),
-            load_jit=model_options.load_jit,
-            load_trt=model_options.load_trt,
-            load_vllm=model_options.load_vllm,
-            fp16=model_options.fp16,
-        )
+        return AutoModel(**model_kwargs)
+
+
+def build_model_kwargs(model_options: CosyVoiceModelOptions) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "model_dir": str(model_options.model_dir),
+        "fp16": model_options.fp16,
+    }
+    if (model_options.model_dir / "cosyvoice3.yaml").is_file():
+        kwargs["load_trt"] = model_options.load_trt
+        kwargs["load_vllm"] = model_options.load_vllm
+    elif (model_options.model_dir / "cosyvoice.yaml").is_file():
+        kwargs["load_jit"] = model_options.load_jit
+        kwargs["load_trt"] = model_options.load_trt
+    else:
+        kwargs["load_jit"] = model_options.load_jit
+        kwargs["load_trt"] = model_options.load_trt
+        kwargs["load_vllm"] = model_options.load_vllm
+    return kwargs
 
 
 def load_prompt_audio_16k(audio_path: Path):
@@ -397,6 +414,7 @@ def ensure_zero_shot_speaker(
 ) -> None:
     if not hasattr(cosyvoice_model, "add_zero_shot_spk"):
         raise RuntimeError("This CosyVoice runtime does not expose add_zero_shot_spk().")
+    prompt_text = ensure_cosyvoice3_prompt_text(cosyvoice_model, prompt_text)
     ok = cosyvoice_model.add_zero_shot_spk(prompt_text, prompt_audio_16k, voice_id)
     if ok is not True:
         raise RuntimeError(f"Failed to add zero-shot speaker '{voice_id}'.")
@@ -416,6 +434,7 @@ def iter_synthesis(
     prompt_text = reference.prompt_text or ""
 
     if options.mode == "zero_shot":
+        prompt_text = ensure_cosyvoice3_prompt_text(cosyvoice_model, prompt_text)
         return cosyvoice_model.inference_zero_shot(
             text,
             prompt_text,
@@ -427,6 +446,7 @@ def iter_synthesis(
         )
 
     if options.mode == "cross_lingual":
+        text = ensure_cosyvoice3_tts_text(cosyvoice_model, text)
         return cosyvoice_model.inference_cross_lingual(
             text,
             prompt_audio,
@@ -436,7 +456,48 @@ def iter_synthesis(
             text_frontend=options.text_frontend,
         )
 
+    if options.mode == "instruct2":
+        if not hasattr(cosyvoice_model, "inference_instruct2"):
+            raise RuntimeError("This CosyVoice runtime does not expose inference_instruct2().")
+        instruct_text = (options.instruct_text or "").strip()
+        if not instruct_text:
+            raise ValueError("instruct2 mode requires instruct_text.")
+        instruct_text = ensure_cosyvoice3_instruct_text(cosyvoice_model, instruct_text)
+        if not prompt_audio:
+            raise ValueError("instruct2 mode requires a reference audio file.")
+        return cosyvoice_model.inference_instruct2(
+            text,
+            instruct_text,
+            prompt_audio,
+            zero_shot_spk_id=voice_id or "",
+            stream=options.stream,
+            speed=options.speed,
+            text_frontend=options.text_frontend,
+        )
+
     raise ValueError(f"Unsupported mode: {options.mode}")
+
+
+def is_cosyvoice3_model(cosyvoice_model) -> bool:
+    return cosyvoice_model.__class__.__name__ == "CosyVoice3"
+
+
+def ensure_cosyvoice3_prompt_text(cosyvoice_model, prompt_text: str) -> str:
+    if not is_cosyvoice3_model(cosyvoice_model) or COSYVOICE3_PROMPT_MARKER in prompt_text:
+        return prompt_text
+    return f"{COSYVOICE3_PROMPT_PREFIX}{prompt_text}"
+
+
+def ensure_cosyvoice3_tts_text(cosyvoice_model, text: str) -> str:
+    if not is_cosyvoice3_model(cosyvoice_model) or COSYVOICE3_PROMPT_MARKER in text:
+        return text
+    return f"{COSYVOICE3_PROMPT_PREFIX}{text}"
+
+
+def ensure_cosyvoice3_instruct_text(cosyvoice_model, instruct_text: str) -> str:
+    if not is_cosyvoice3_model(cosyvoice_model) or COSYVOICE3_PROMPT_MARKER in instruct_text:
+        return instruct_text
+    return f"You are a helpful assistant. {instruct_text}{COSYVOICE3_PROMPT_MARKER}"
 
 
 def save_outputs_to_wav(outputs, sample_rate: int, output_path: Path) -> None:
@@ -583,6 +644,7 @@ def main(argv: list[str] | None = None) -> int:
             text_frontend=text_frontend,
             speed=args.speed,
             stream=parse_on_off(args.stream),
+            instruct_text=args.instruct_text,
         )
 
         if options.mode == "zero_shot" and run.reference.audio_path and not (run.reference.prompt_text or "").strip():
@@ -597,7 +659,7 @@ def main(argv: list[str] | None = None) -> int:
         model_load_seconds = time.perf_counter() - model_load_started
         print(f"Model ready in {format_duration(model_load_seconds)}")
 
-        if run.reference.audio_path:
+        if options.mode == "zero_shot" and run.reference.audio_path:
             prompt_audio_16k = load_prompt_audio_16k(run.reference.audio_path)
             ensure_zero_shot_speaker(
                 cosyvoice_model,

@@ -95,6 +95,7 @@ class DummyRequest:
         mode: str | None = None,
         text_frontend: bool | None = None,
         speed: float | None = None,
+        instruct_text: str | None = None,
         reference_audio_base64: str | None = None,
         reference_audio_filename: str | None = None,
         reference_text: str | None = None,
@@ -108,6 +109,7 @@ class DummyRequest:
         self.mode = mode
         self.text_frontend = text_frontend
         self.speed = speed
+        self.instruct_text = instruct_text
         self.reference_audio_base64 = reference_audio_base64
         self.reference_audio_filename = reference_audio_filename
         self.reference_text = reference_text
