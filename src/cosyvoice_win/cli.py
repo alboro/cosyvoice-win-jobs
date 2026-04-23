@@ -6,6 +6,8 @@ import shutil
 import sys
 import time
 import warnings
+import builtins
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -61,6 +63,7 @@ class CosyVoiceModelOptions:
     load_jit: bool = False
     load_trt: bool = False
     load_vllm: bool = False
+    text_frontend: bool = DEFAULT_TEXT_FRONTEND
 
 
 @dataclass(slots=True)
@@ -344,20 +347,44 @@ def load_cosyvoice_runtime():
     return AutoModel, load_wav
 
 
+@contextmanager
+def maybe_disable_text_frontend_imports(text_frontend: bool):
+    if text_frontend:
+        yield
+        return
+
+    real_import = builtins.__import__
+    blocked_roots = {"ttsfrd", "wetext"}
+
+    def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+        root_name = name.split(".", 1)[0]
+        if level == 0 and root_name in blocked_roots:
+            raise ImportError(f"{root_name} disabled because CosyVoice text_frontend is off")
+        return real_import(name, globals, locals, fromlist, level)
+
+    builtins.__import__ = guarded_import
+    try:
+        yield
+    finally:
+        builtins.__import__ = real_import
+
+
 def load_model(model_options: CosyVoiceModelOptions):
     AutoModel, _ = load_cosyvoice_runtime()
-    return AutoModel(
-        model_dir=str(model_options.model_dir),
-        load_jit=model_options.load_jit,
-        load_trt=model_options.load_trt,
-        load_vllm=model_options.load_vllm,
-        fp16=model_options.fp16,
-    )
+    with maybe_disable_text_frontend_imports(model_options.text_frontend):
+        return AutoModel(
+            model_dir=str(model_options.model_dir),
+            load_jit=model_options.load_jit,
+            load_trt=model_options.load_trt,
+            load_vllm=model_options.load_vllm,
+            fp16=model_options.fp16,
+        )
 
 
 def load_prompt_audio_16k(audio_path: Path):
-    _, load_wav = load_cosyvoice_runtime()
-    return load_wav(str(audio_path), 16000)
+    # Current upstream CosyVoice APIs accept a path/file-like object and call
+    # load_wav internally. Passing a preloaded tensor breaks newer checkouts.
+    return str(audio_path)
 
 
 def ensure_zero_shot_speaker(
@@ -542,16 +569,18 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         run = resolve_cli_inputs(args, parser, shared_dir, output_dir)
+        text_frontend = parse_on_off(args.text_frontend)
         model_options = CosyVoiceModelOptions(
             model_dir=model_dir,
             fp16=parse_on_off(args.fp16),
             load_jit=parse_on_off(args.load_jit),
             load_trt=parse_on_off(args.load_trt),
             load_vllm=parse_on_off(args.load_vllm),
+            text_frontend=text_frontend,
         )
         options = CosyVoiceSynthesisOptions(
             mode=args.mode,
-            text_frontend=parse_on_off(args.text_frontend),
+            text_frontend=text_frontend,
             speed=args.speed,
             stream=parse_on_off(args.stream),
         )

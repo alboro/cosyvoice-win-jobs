@@ -58,6 +58,14 @@ For a Windows machine with **RTX 3070 Ti 8GB**, the most realistic first deploym
 
 Native Windows may work, but I would treat it as the experimental path. WSL2 is the safer operational target.
 
+Current native Windows smoke status:
+
+- tested with local Miniforge under `.conda/miniforge`
+- tested with `FunAudioLLM/CosyVoice2-0.5B`
+- tested with CUDA on RTX 3070 Ti
+- CLI zero-shot synthesis works with UTF-8 Russian text files
+- polling jobs API works on `127.0.0.1:8040`
+
 ## Features
 
 - polling jobs API: `POST /v1/tts/jobs`, `GET /v1/tts/jobs/{id}`, `GET /v1/tts/jobs/{id}/audio`
@@ -258,6 +266,10 @@ The included bootstrap script is designed to:
 3. install official CosyVoice requirements
 4. install this wrapper in editable mode
 
+On Windows the wrapper scripts first look for a repo-local conda executable at `.conda/miniforge/Scripts/conda.exe`, then fall back to `conda` from `PATH`.
+
+If ModelScope downloads fail because of local SSL certificates, downloading `FunAudioLLM/CosyVoice2-0.5B` from Hugging Face into `pretrained_models/CosyVoice2-0.5B` is a valid fallback.
+
 Model weights are not committed. Put them under:
 
 - `pretrained_models/CosyVoice2-0.5B`
@@ -270,6 +282,12 @@ cosyvoice-win-server.cmd --host 127.0.0.1 --port 8040
 ```
 
 Then place a reference bundle into `shared/` and submit a job.
+
+For Russian CLI smoke tests, prefer `--file` with a UTF-8 text file instead of inline Cyrillic through `cmd.exe`:
+
+```cmd
+cosyvoice-win.cmd --file input\ru_smoke.txt ru_smoke.wav reference_dictor_short --overwrite
+```
 
 ## Caveats
 

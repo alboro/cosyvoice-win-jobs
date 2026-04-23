@@ -9,6 +9,7 @@ import os
 import queue
 import shutil
 import tempfile
+import sys
 import threading
 import time
 import uuid
@@ -460,6 +461,7 @@ class SynthesisWorker:
                 load_jit=self.settings.load_jit,
                 load_trt=self.settings.load_trt,
                 load_vllm=self.settings.load_vllm,
+                text_frontend=self.settings.text_frontend,
             )
         )
         self._loaded_model = LoadedModel(tts=tts, load_seconds=time.perf_counter() - started)
@@ -558,6 +560,7 @@ class SynthesisWorker:
 
         log_path = self.store.log_path(job_id)
         with log_path.open("a", encoding="utf-8") as log_file:
+            route_python_logging_to_stream(log_file)
             try:
                 started_at = utcnow_iso()
                 self.store.update_job(job_id, status="in_progress", started_at=started_at)
@@ -623,6 +626,8 @@ class SynthesisWorker:
                     audio_ready=False,
                 )
                 log_line(log_file, f"Job {job_id} failed at {failed_at}: {exc}")
+            finally:
+                route_python_logging_to_stream(sys.stderr)
 
     def _load_job_request_payload(self, job_id: str) -> dict[str, Any]:
         request_path = self.store.job_dir(job_id) / "request.json"
@@ -1241,6 +1246,13 @@ def log_line(handle, message: str) -> None:
     timestamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
     handle.write(f"[{timestamp}] {message}\n")
     handle.flush()
+
+
+def route_python_logging_to_stream(stream: Any) -> None:
+    root_logger = logging.getLogger()
+    for handler in root_logger.handlers:
+        if isinstance(handler, logging.StreamHandler):
+            handler.stream = stream
 
 
 def _pick_override(value: Any, default: Any) -> Any:
