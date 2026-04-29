@@ -8,8 +8,9 @@ import logging
 import os
 import queue
 import shutil
-import tempfile
+import struct
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -21,11 +22,12 @@ from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, status
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from cosyvoice_win.cli import (
     DEFAULT_FP16,
+    DEFAULT_FIX_QUESTION_INTONATION,
     DEFAULT_MODEL_DIR,
     DEFAULT_MODEL_ID,
     DEFAULT_MODE,
@@ -42,11 +44,14 @@ from cosyvoice_win.cli import (
     find_reference_audio_in_shared,
     find_reference_text_for_audio,
     format_duration,
+    build_runtime_instruction_text,
     load_model,
     load_prompt_audio_16k,
     parse_on_off,
+    resolve_effective_mode,
     resolve_dir,
     resolve_model_dir,
+    iter_synthesis,
     synthesize_to_file,
 )
 
@@ -58,7 +63,8 @@ DEFAULT_JOB_OUTPUT_NAME = "audio.wav"
 DEFAULT_JOB_RETENTION_HOURS = 24
 DEFAULT_DOWNLOADED_JOB_RETENTION_HOURS = 6
 DEFAULT_CLEANUP_INTERVAL_SECONDS = 900
-SUPPORTED_RESPONSE_FORMATS = {"wav"}
+SUPPORTED_JOB_RESPONSE_FORMATS = {"wav"}
+SUPPORTED_DIRECT_RESPONSE_FORMATS = {"wav", "pcm"}
 
 AUDIO_MIME_TO_EXT = {
     "audio/wav": ".wav",
@@ -84,6 +90,9 @@ class CreateTTSJobRequest(BaseModel):
     mode: str | None = Field(default=None, pattern="^(zero_shot|cross_lingual|instruct2)$")
     text_frontend: bool | None = None
     speed: float | None = Field(default=None, gt=0)
+    stream: bool | None = None
+    fix_question_intonation: bool | None = None
+    instructions: str | None = None
     instruct_text: str | None = None
     reference_audio_base64: str | None = None
     reference_audio_filename: str | None = None
@@ -117,6 +126,7 @@ class ServerSettings:
     model_dir: Path = DEFAULT_MODEL_DIR
     mode: str = DEFAULT_MODE
     text_frontend: bool = DEFAULT_TEXT_FRONTEND
+    fix_question_intonation: bool = DEFAULT_FIX_QUESTION_INTONATION
     speed: float = DEFAULT_SPEED
     fp16: bool = DEFAULT_FP16
     load_jit: bool = False
@@ -132,6 +142,72 @@ class ServerSettings:
 class LoadedModel:
     tts: Any
     load_seconds: float
+
+
+class CreateSpeechRequest(CreateTTSJobRequest):
+    """OpenAI-compatible /v1/audio/speech request.
+
+    The async jobs API accepts the same superset for compatibility, but only
+    this endpoint uses ``stream`` to return audio directly.
+    """
+
+
+def audio_media_type(response_format: str) -> str:
+    normalized = response_format.lower()
+    if normalized == "pcm":
+        return "audio/pcm; codecs=pcm_s16le"
+    return "audio/wav"
+
+
+def wav_header(sample_rate: int, data_size: int | None = None, *, channels: int = 1) -> bytes:
+    """Build a PCM WAV header.
+
+    ``data_size=None`` is used for chunked transfer where the final length is
+    not known before streaming starts. Most clients tolerate the max-size
+    placeholder and play the stream incrementally.
+    """
+    bits_per_sample = 16
+    block_align = channels * bits_per_sample // 8
+    byte_rate = sample_rate * block_align
+    if data_size is None:
+        riff_size = 0xFFFFFFFF
+        data_size = 0xFFFFFFFF
+    else:
+        riff_size = 36 + data_size
+    return struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF",
+        riff_size,
+        b"WAVE",
+        b"fmt ",
+        16,
+        1,
+        channels,
+        sample_rate,
+        byte_rate,
+        block_align,
+        bits_per_sample,
+        b"data",
+        data_size,
+    )
+
+
+def output_to_pcm16_bytes(output: dict[str, Any]) -> bytes:
+    speech = output["tts_speech"].detach().cpu().float()
+    if getattr(speech, "dim", lambda: 0)() == 2:
+        if speech.shape[0] == 1:
+            speech = speech.squeeze(0)
+        else:
+            speech = speech[0]
+    speech = speech.clamp(-1.0, 1.0).mul(32767.0).short().contiguous()
+    return speech.numpy().tobytes()
+
+
+def render_audio_bytes(outputs, sample_rate: int, response_format: str) -> bytes:
+    pcm = b"".join(output_to_pcm16_bytes(output) for output in outputs)
+    if response_format.lower() == "pcm":
+        return pcm
+    return wav_header(sample_rate, len(pcm)) + pcm
 
 
 class JobStore:
@@ -218,6 +294,9 @@ class JobStore:
             "mode": request.mode,
             "text_frontend": request.text_frontend,
             "speed": request.speed,
+            "stream": request.stream,
+            "fix_question_intonation": request.fix_question_intonation,
+            "instructions": request.instructions,
             "instruct_text": request.instruct_text,
             "reference_text": request.reference_text,
             "force_rebuild_voice": request.force_rebuild_voice,
@@ -636,15 +715,108 @@ class SynthesisWorker:
         return json.loads(request_path.read_text(encoding="utf-8"))
 
     def _build_job_synthesis_options(self, payload: dict[str, Any]) -> CosyVoiceSynthesisOptions:
+        fix_question_intonation = _pick_override(
+            payload.get("fix_question_intonation"),
+            self.settings.fix_question_intonation,
+        )
+        instruct_text = build_runtime_instruction_text(
+            text=str(payload.get("input") or ""),
+            instruct_text=payload.get("instruct_text"),
+            instructions=payload.get("instructions"),
+            fix_question_intonation=bool(fix_question_intonation),
+        )
+        requested_mode = str(payload.get("mode") or self.settings.mode)
         return CosyVoiceSynthesisOptions(
-            mode=str(payload.get("mode") or self.settings.mode),
+            mode=resolve_effective_mode(
+                requested_mode,
+                text=str(payload.get("input") or ""),
+                instruct_text=payload.get("instruct_text"),
+                instructions=payload.get("instructions"),
+                fix_question_intonation=bool(fix_question_intonation),
+            ),
+            requested_mode=requested_mode,
             text_frontend=_pick_override(payload.get("text_frontend"), self.settings.text_frontend),
             speed=float(_pick_override(payload.get("speed"), self.settings.speed)),
-            instruct_text=(payload.get("instruct_text") or None),
-            stream=False,
+            fix_question_intonation=bool(fix_question_intonation),
+            instruct_text=instruct_text,
+            stream=bool(payload.get("stream")),
         )
 
-    def _prepare_voice(self, cosyvoice_model, *, voice_id: str, uploaded_reference: Path | None, payload: dict[str, Any]) -> tuple[ResolvedReference, Path | None]:
+    def iter_direct_synthesis(
+        self,
+        payload: dict[str, Any],
+        *,
+        uploaded_reference: Path | None = None,
+    ):
+        voice_id = str(payload["voice"]).strip() or "reference"
+        options = self._build_job_synthesis_options(payload)
+        with self._infer_lock:
+            loaded_model = self._ensure_model()
+            reference, _voice_profile_path = self._prepare_voice(
+                loaded_model.tts,
+                voice_id=voice_id,
+                payload=payload,
+                uploaded_reference=uploaded_reference,
+            )
+            yield from iter_synthesis(
+                loaded_model.tts,
+                text=str(payload["input"]).strip(),
+                voice_id=voice_id,
+                reference=reference,
+                options=options,
+            )
+
+    def synthesize_direct_bytes(
+        self,
+        payload: dict[str, Any],
+        *,
+        response_format: str,
+        uploaded_reference: Path | None = None,
+    ) -> bytes:
+        outputs = list(self.iter_direct_synthesis(payload, uploaded_reference=uploaded_reference))
+        loaded_model = self._loaded_model
+        if loaded_model is None:
+            raise RuntimeError("CosyVoice model was not loaded.")
+        return render_audio_bytes(outputs, loaded_model.tts.sample_rate, response_format)
+
+    def stream_direct_audio(
+        self,
+        payload: dict[str, Any],
+        *,
+        response_format: str,
+        uploaded_reference: Path | None = None,
+    ):
+        voice_id = str(payload["voice"]).strip() or "reference"
+        options = self._build_job_synthesis_options(payload)
+        with self._infer_lock:
+            loaded_model = self._ensure_model()
+            reference, _voice_profile_path = self._prepare_voice(
+                loaded_model.tts,
+                voice_id=voice_id,
+                payload=payload,
+                uploaded_reference=uploaded_reference,
+            )
+            if response_format.lower() == "wav":
+                yield wav_header(loaded_model.tts.sample_rate)
+            for output in iter_synthesis(
+                loaded_model.tts,
+                text=str(payload["input"]).strip(),
+                voice_id=voice_id,
+                reference=reference,
+                options=options,
+            ):
+                chunk = output_to_pcm16_bytes(output)
+                if chunk:
+                    yield chunk
+
+    def _prepare_voice(
+        self,
+        cosyvoice_model,
+        *,
+        voice_id: str,
+        payload: dict[str, Any],
+        uploaded_reference: Path | None = None,
+    ) -> tuple[ResolvedReference, Path | None]:
         force_rebuild = bool(payload.get("force_rebuild_voice"))
         profile = self.voices.get(voice_id)
 
@@ -828,6 +1000,11 @@ def parse_args(argv: list[str] | None = None) -> ServerSettings:
         choices=("on", "off"),
         default="on" if DEFAULT_TEXT_FRONTEND else "off",
     )
+    parser.add_argument(
+        "--fix-question-intonation",
+        choices=("on", "off"),
+        default="on" if DEFAULT_FIX_QUESTION_INTONATION else "off",
+    )
     parser.add_argument("--speed", type=float, default=DEFAULT_SPEED)
     parser.add_argument("--fp16", choices=("on", "off"), default="on" if DEFAULT_FP16 else "off")
     parser.add_argument("--load-jit", choices=("on", "off"), default="off")
@@ -852,6 +1029,7 @@ def parse_args(argv: list[str] | None = None) -> ServerSettings:
         model_dir=resolve_model_dir(args.model_dir),
         mode=args.mode,
         text_frontend=parse_on_off(args.text_frontend),
+        fix_question_intonation=parse_on_off(args.fix_question_intonation),
         speed=args.speed,
         fp16=parse_on_off(args.fp16),
         load_jit=parse_on_off(args.load_jit),
@@ -920,6 +1098,7 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
             "cached_voices": voices.count(),
             "mode": server_settings.mode,
             "text_frontend": server_settings.text_frontend,
+            "fix_question_intonation": server_settings.fix_question_intonation,
             "speed": server_settings.speed,
             "fp16": server_settings.fp16,
             "job_retention_hours": server_settings.job_retention_hours,
@@ -1029,81 +1208,6 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
         worker.forget_voice(safe)
         return {"name": safe, "deleted": deleted}
 
-    @app.post("/v1/audio/speech")
-    def create_speech(request: CreateTTSJobRequest) -> Response:
-        """Synchronous, single-shot synthesis: render and return the audio in one
-        request instead of polling a job. Shares the resident model and voice cache
-        with the jobs worker."""
-        if request.model != server_settings.model_id:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Only model '{server_settings.model_id}' is currently supported.",
-            )
-
-        fmt = request.response_format.lower()
-        if fmt not in DIRECT_RESPONSE_FORMATS:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Supported response_format values: " + ", ".join(sorted(DIRECT_RESPONSE_FORMATS)) + ".",
-            )
-
-        text = request.input.strip()
-        if not text:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="input must not be empty.")
-
-        voice_id = (request.voice or "reference").strip() or "reference"
-        normalized = CreateTTSJobRequest(
-            input=text,
-            model=request.model,
-            voice=voice_id,
-            response_format=fmt,
-            mode=request.mode or server_settings.mode,
-            text_frontend=_pick_override(request.text_frontend, server_settings.text_frontend),
-            speed=_pick_override(request.speed, server_settings.speed),
-            reference_audio_base64=request.reference_audio_base64,
-            reference_audio_filename=request.reference_audio_filename,
-            reference_text=(request.reference_text or "").strip() or None,
-            force_rebuild_voice=bool(request.force_rebuild_voice),
-            metadata=request.metadata,
-        )
-
-        with tempfile.TemporaryDirectory(prefix="cosyvoice-direct-") as tmp:
-            tmp_dir = Path(tmp)
-            uploaded_reference: Path | None = None
-            if normalized.reference_audio_base64:
-                try:
-                    uploaded_reference = decode_reference_audio_to_file(
-                        encoded=normalized.reference_audio_base64,
-                        filename=normalized.reference_audio_filename,
-                        job_dir=tmp_dir,
-                    )
-                except ValueError as exc:
-                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-
-            output_path = tmp_dir / DEFAULT_JOB_OUTPUT_NAME
-            try:
-                worker.synthesize_request(
-                    normalized,
-                    output_path=output_path,
-                    uploaded_reference=uploaded_reference,
-                )
-                content, media_type, filename = encode_output(output_path, fmt)
-            except HTTPException:
-                raise
-            except ValueError as exc:
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-            except Exception as exc:
-                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
-
-        return Response(
-            content=content,
-            media_type=media_type,
-            headers={
-                "Content-Disposition": f'attachment; filename="{filename}"',
-                "X-Voice": voice_id,
-            },
-        )
-
     @app.post("/v1/unload")
     def unload() -> dict[str, Any]:
         """Free the resident CosyVoice model so memory drops back down. Clients
@@ -1119,7 +1223,7 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
                 detail=f"Only model '{server_settings.model_id}' is currently supported.",
             )
 
-        if request.response_format.lower() not in SUPPORTED_RESPONSE_FORMATS:
+        if request.response_format.lower() not in SUPPORTED_JOB_RESPONSE_FORMATS:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Only response_format='wav' is currently supported.",
@@ -1130,10 +1234,33 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
             model=request.model,
             voice=(request.voice or "reference").strip() or "reference",
             response_format=request.response_format.lower(),
-            mode=request.mode or server_settings.mode,
+            mode=resolve_effective_mode(
+                request.mode or server_settings.mode,
+                text=request.input.strip(),
+                instruct_text=request.instruct_text,
+                instructions=request.instructions,
+                fix_question_intonation=_pick_override(
+                    request.fix_question_intonation,
+                    server_settings.fix_question_intonation,
+                ),
+            ),
             text_frontend=_pick_override(request.text_frontend, server_settings.text_frontend),
             speed=_pick_override(request.speed, server_settings.speed),
-            instruct_text=(request.instruct_text or "").strip() or None,
+            stream=bool(request.stream),
+            fix_question_intonation=_pick_override(
+                request.fix_question_intonation,
+                server_settings.fix_question_intonation,
+            ),
+            instructions=(request.instructions or "").strip() or None,
+            instruct_text=build_runtime_instruction_text(
+                text=request.input.strip(),
+                instruct_text=request.instruct_text,
+                instructions=request.instructions,
+                fix_question_intonation=_pick_override(
+                    request.fix_question_intonation,
+                    server_settings.fix_question_intonation,
+                ),
+            ),
             reference_audio_base64=request.reference_audio_base64,
             reference_audio_filename=request.reference_audio_filename,
             reference_text=(request.reference_text or "").strip() or None,
@@ -1151,6 +1278,134 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
 
         worker.submit(job["id"])
         return job
+
+    @app.post("/v1/audio/speech")
+    def create_audio_speech(request: CreateSpeechRequest):
+        gc.sweep_now()
+        if request.model != server_settings.model_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Only model '{server_settings.model_id}' is currently supported.",
+            )
+
+        response_format = request.response_format.lower()
+        supported_formats = SUPPORTED_DIRECT_RESPONSE_FORMATS | DIRECT_RESPONSE_FORMATS
+        if response_format not in supported_formats:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Supported response_format values: " + ", ".join(sorted(supported_formats)) + ".",
+            )
+        if request.stream and response_format not in SUPPORTED_DIRECT_RESPONSE_FORMATS:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Streaming supports only response_format='wav' or response_format='pcm'.",
+            )
+
+        payload = {
+            "input": request.input.strip(),
+            "model": request.model,
+            "voice": (request.voice or "reference").strip() or "reference",
+            "response_format": response_format,
+            "mode": resolve_effective_mode(
+                request.mode or server_settings.mode,
+                text=request.input.strip(),
+                instruct_text=request.instruct_text,
+                instructions=request.instructions,
+                fix_question_intonation=_pick_override(
+                    request.fix_question_intonation,
+                    server_settings.fix_question_intonation,
+                ),
+            ),
+            "text_frontend": _pick_override(request.text_frontend, server_settings.text_frontend),
+            "fix_question_intonation": _pick_override(
+                request.fix_question_intonation,
+                server_settings.fix_question_intonation,
+            ),
+            "speed": _pick_override(request.speed, server_settings.speed),
+            "stream": bool(request.stream),
+            "instructions": (request.instructions or "").strip() or None,
+            "instruct_text": build_runtime_instruction_text(
+                text=request.input.strip(),
+                instruct_text=request.instruct_text,
+                instructions=request.instructions,
+                fix_question_intonation=_pick_override(
+                    request.fix_question_intonation,
+                    server_settings.fix_question_intonation,
+                ),
+            ),
+            "reference_text": (request.reference_text or "").strip() or None,
+            "force_rebuild_voice": bool(request.force_rebuild_voice),
+            "metadata": request.metadata or {},
+            "reference_audio_uploaded": bool(request.reference_audio_base64),
+            "reference_audio_filename": request.reference_audio_filename,
+        }
+        if not payload["input"]:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="input must not be empty.")
+
+        def decode_uploaded_reference(temp_dir: Path) -> Path | None:
+            if not request.reference_audio_base64:
+                return None
+            return decode_reference_audio_to_file(
+                encoded=request.reference_audio_base64,
+                filename=request.reference_audio_filename,
+                job_dir=temp_dir,
+            )
+
+        if request.stream:
+            def audio_stream():
+                with tempfile.TemporaryDirectory(prefix="cosyvoice-direct-") as temp_dir_raw:
+                    uploaded_reference = decode_uploaded_reference(Path(temp_dir_raw))
+                    try:
+                        yield from worker.stream_direct_audio(
+                            payload,
+                            response_format=response_format,
+                            uploaded_reference=uploaded_reference,
+                        )
+                    except Exception:
+                        logger.exception("Direct streaming speech synthesis failed.")
+                        raise
+
+            return StreamingResponse(
+                audio_stream(),
+                media_type=audio_media_type(response_format),
+                headers={
+                    "Cache-Control": "no-cache",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+
+        with tempfile.TemporaryDirectory(prefix="cosyvoice-direct-") as temp_dir_raw:
+            uploaded_reference = decode_uploaded_reference(Path(temp_dir_raw))
+            try:
+                if response_format in SUPPORTED_DIRECT_RESPONSE_FORMATS:
+                    content = worker.synthesize_direct_bytes(
+                        payload,
+                        response_format=response_format,
+                        uploaded_reference=uploaded_reference,
+                    )
+                    media_type = audio_media_type(response_format)
+                    filename = f"speech.{response_format}"
+                else:
+                    output_path = Path(temp_dir_raw) / DEFAULT_JOB_OUTPUT_NAME
+                    worker.synthesize_request(
+                        request,
+                        output_path=output_path,
+                        uploaded_reference=uploaded_reference,
+                    )
+                    content, media_type, filename = encode_output(output_path, response_format)
+            except ValueError as exc:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+            except Exception as exc:
+                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
+
+        return Response(
+            content=content,
+            media_type=media_type,
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "X-Voice": str(payload["voice"]),
+            },
+        )
 
     @app.get("/v1/tts/jobs/{job_id}")
     def get_tts_job(job_id: str) -> dict[str, Any]:
@@ -1276,6 +1531,10 @@ def build_request_payload(request: "CreateTTSJobRequest") -> dict[str, Any]:
         "mode": request.mode,
         "text_frontend": request.text_frontend,
         "speed": request.speed,
+        "stream": request.stream,
+        "fix_question_intonation": request.fix_question_intonation,
+        "instructions": request.instructions,
+        "instruct_text": request.instruct_text,
         "reference_text": request.reference_text,
         "force_rebuild_voice": request.force_rebuild_voice,
         "metadata": request.metadata or {},

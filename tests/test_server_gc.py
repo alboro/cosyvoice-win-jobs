@@ -31,6 +31,7 @@ if "fastapi" not in sys.modules:
     sys.modules["fastapi"] = types.SimpleNamespace(
         FastAPI=_DummyFastAPI,
         HTTPException=Exception,
+        Request=object,
         status=types.SimpleNamespace(
             HTTP_201_CREATED=201,
             HTTP_202_ACCEPTED=202,
@@ -42,7 +43,12 @@ if "fastapi" not in sys.modules:
     )
 
 if "fastapi.responses" not in sys.modules:
-    sys.modules["fastapi.responses"] = types.SimpleNamespace(FileResponse=object, Response=object)
+    sys.modules["fastapi.responses"] = types.SimpleNamespace(
+        FileResponse=object,
+        JSONResponse=object,
+        Response=object,
+        StreamingResponse=object,
+    )
 
 if "pydantic" not in sys.modules:
     class _DummyBaseModel:
@@ -56,6 +62,7 @@ if "pydantic" not in sys.modules:
 if "cosyvoice_win.cli" not in sys.modules:
     fake_cli = types.SimpleNamespace(
         DEFAULT_FP16=True,
+        DEFAULT_FIX_QUESTION_INTONATION=False,
         DEFAULT_MODEL_DIR=FAKE_PROJECT_ROOT / "pretrained_models" / "CosyVoice2-0.5B",
         DEFAULT_MODEL_ID="CosyVoice2-0.5B",
         DEFAULT_MODE="zero_shot",
@@ -67,6 +74,7 @@ if "cosyvoice_win.cli" not in sys.modules:
         CosyVoiceModelOptions=lambda **kwargs: kwargs,
         CosyVoiceSynthesisOptions=lambda **kwargs: kwargs,
         ResolvedReference=lambda **kwargs: types.SimpleNamespace(**kwargs),
+        build_runtime_instruction_text=lambda **kwargs: kwargs.get("instruct_text") or kwargs.get("instructions"),
         ensure_zero_shot_speaker=lambda *args, **kwargs: None,
         estimate_audio_duration_seconds=lambda text, speed=1.0: float(len(text.split())),
         find_reference_audio_in_shared=lambda *args, **kwargs: FAKE_PROJECT_ROOT / "shared" / "reference.wav",
@@ -75,13 +83,22 @@ if "cosyvoice_win.cli" not in sys.modules:
         load_model=lambda *args, **kwargs: object(),
         load_prompt_audio_16k=lambda *args, **kwargs: object(),
         parse_on_off=lambda value: bool(value) if isinstance(value, bool) else str(value).lower() == "on",
+        resolve_effective_mode=lambda mode, **kwargs: mode,
         resolve_dir=lambda value: Path(value),
         resolve_model_dir=lambda value: Path(value),
+        iter_synthesis=lambda *args, **kwargs: iter(()),
         synthesize_to_file=lambda *args, **kwargs: 1,
     )
     sys.modules["cosyvoice_win.cli"] = fake_cli
 
-from cosyvoice_win.server import JobStore, VoiceStore
+from cosyvoice_win.server import (
+    SUPPORTED_DIRECT_RESPONSE_FORMATS,
+    SUPPORTED_JOB_RESPONSE_FORMATS,
+    JobStore,
+    VoiceStore,
+    audio_media_type,
+    wav_header,
+)
 
 
 class DummyRequest:
@@ -95,6 +112,9 @@ class DummyRequest:
         mode: str | None = None,
         text_frontend: bool | None = None,
         speed: float | None = None,
+        stream: bool | None = None,
+        fix_question_intonation: bool | None = None,
+        instructions: str | None = None,
         instruct_text: str | None = None,
         reference_audio_base64: str | None = None,
         reference_audio_filename: str | None = None,
@@ -109,6 +129,9 @@ class DummyRequest:
         self.mode = mode
         self.text_frontend = text_frontend
         self.speed = speed
+        self.stream = stream
+        self.fix_question_intonation = fix_question_intonation
+        self.instructions = instructions
         self.instruct_text = instruct_text
         self.reference_audio_base64 = reference_audio_base64
         self.reference_audio_filename = reference_audio_filename
@@ -310,6 +333,23 @@ class TestBuildRequestPayload(unittest.TestCase):
         self.assertEqual(payload["mode"], "zero_shot")
         self.assertEqual(payload["reference_text"], "exact")
         self.assertEqual(payload["metadata"], {})
+
+
+class TestDirectAudioHelpers(unittest.TestCase):
+    def test_direct_endpoint_supports_pcm_without_changing_job_formats(self):
+        self.assertEqual(SUPPORTED_JOB_RESPONSE_FORMATS, {"wav"})
+        self.assertIn("wav", SUPPORTED_DIRECT_RESPONSE_FORMATS)
+        self.assertIn("pcm", SUPPORTED_DIRECT_RESPONSE_FORMATS)
+        self.assertEqual(audio_media_type("pcm"), "audio/pcm; codecs=pcm_s16le")
+        self.assertEqual(audio_media_type("wav"), "audio/wav")
+
+    def test_streaming_wav_header_uses_unknown_length_placeholder(self):
+        header = wav_header(24000)
+
+        self.assertEqual(header[:4], b"RIFF")
+        self.assertEqual(header[8:12], b"WAVE")
+        self.assertEqual(int.from_bytes(header[4:8], "little"), 0xFFFFFFFF)
+        self.assertEqual(int.from_bytes(header[40:44], "little"), 0xFFFFFFFF)
 
 
 if __name__ == "__main__":

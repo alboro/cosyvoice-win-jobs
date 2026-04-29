@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import sys
 import time
@@ -24,8 +25,16 @@ DEFAULT_SPEED = 1.0
 DEFAULT_TEXT_FRONTEND = False
 DEFAULT_FP16 = True
 DEFAULT_STREAM = False
+DEFAULT_FIX_QUESTION_INTONATION = False
 COSYVOICE3_PROMPT_PREFIX = "You are a helpful assistant.<|endofprompt|>"
 COSYVOICE3_PROMPT_MARKER = "<|endofprompt|>"
+QUESTION_INTONATION_INSTRUCTION = (
+    "Read only the target text with clear question intonation. Do not read the instruction aloud."
+)
+QUESTION_TRAILING_CLOSERS = "\"'`»«“”„‟’‘)]}>】』」"
+QUESTION_ENDING_PATTERN = re.compile(
+    r"\?+(?:[" + re.escape(QUESTION_TRAILING_CLOSERS) + r"]+)?(?:[.,;:!…]+)?\s*$"
+)
 
 REFERENCE_AUDIO_EXTENSIONS = {
     ".wav",
@@ -71,9 +80,12 @@ class CosyVoiceModelOptions:
 @dataclass(slots=True)
 class CosyVoiceSynthesisOptions:
     mode: str = DEFAULT_MODE
+    requested_mode: str | None = None
+    mode_reason: str | None = None
     text_frontend: bool = DEFAULT_TEXT_FRONTEND
     speed: float = DEFAULT_SPEED
     stream: bool = DEFAULT_STREAM
+    fix_question_intonation: bool = DEFAULT_FIX_QUESTION_INTONATION
     instruct_text: str | None = None
 
 
@@ -111,8 +123,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-dir", default=str(DEFAULT_MODEL_DIR))
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
     parser.add_argument("--mode", choices=("zero_shot", "cross_lingual", "instruct2"), default=DEFAULT_MODE)
+    parser.add_argument(
+        "--instructions",
+        default=None,
+        help="Non-spoken instruction text. In zero_shot mode this auto-promotes the request to instruct2.",
+    )
     parser.add_argument("--instruct-text", default=None, help="Instruction text for CosyVoice2 instruct2 mode.")
     parser.add_argument("--text-frontend", choices=("on", "off"), default="off")
+    parser.add_argument(
+        "--fix-question-intonation",
+        choices=("on", "off"),
+        default="on" if DEFAULT_FIX_QUESTION_INTONATION else "off",
+        help="Auto-promote trailing questions to instruct2 and add a hidden question-intonation instruction.",
+    )
     parser.add_argument("--speed", type=float, default=DEFAULT_SPEED)
     parser.add_argument("--fp16", choices=("on", "off"), default="on" if DEFAULT_FP16 else "off")
     parser.add_argument("--load-jit", choices=("on", "off"), default="off")
@@ -171,6 +194,74 @@ def read_text_file(path: Path) -> str:
     if not text:
         raise ValueError(f"Input text file is empty: {path}")
     return text
+
+
+def normalize_instruction_text(
+    instruct_text: str | None = None,
+    instructions: str | None = None,
+) -> str | None:
+    value = (instruct_text or instructions or "").strip()
+    return value or None
+
+
+def ends_with_question_intonation_trigger(text: str) -> bool:
+    return bool(QUESTION_ENDING_PATTERN.search(text.rstrip()))
+
+
+def build_runtime_instruction_text(
+    *,
+    text: str,
+    instruct_text: str | None = None,
+    instructions: str | None = None,
+    fix_question_intonation: bool = DEFAULT_FIX_QUESTION_INTONATION,
+) -> str | None:
+    parts: list[str] = []
+    base_instruction = normalize_instruction_text(instruct_text, instructions)
+    if base_instruction:
+        parts.append(base_instruction)
+    if fix_question_intonation and ends_with_question_intonation_trigger(text):
+        if not base_instruction or QUESTION_INTONATION_INSTRUCTION not in base_instruction:
+            parts.append(QUESTION_INTONATION_INSTRUCTION)
+    if not parts:
+        return None
+    return "\n".join(parts)
+
+
+def resolve_mode_reason(
+    *,
+    text: str,
+    instruct_text: str | None = None,
+    instructions: str | None = None,
+    fix_question_intonation: bool = DEFAULT_FIX_QUESTION_INTONATION,
+) -> str | None:
+    has_explicit_instruction = bool(normalize_instruction_text(instruct_text, instructions))
+    has_question_trigger = fix_question_intonation and ends_with_question_intonation_trigger(text)
+    if has_explicit_instruction and has_question_trigger:
+        return "instructions were provided and the input ends with a question mark"
+    if has_explicit_instruction:
+        return "instructions were provided"
+    if has_question_trigger:
+        return "the input ends with a question mark"
+    return None
+
+
+def resolve_effective_mode(
+    mode: str,
+    *,
+    text: str = "",
+    instruct_text: str | None = None,
+    instructions: str | None = None,
+    fix_question_intonation: bool = DEFAULT_FIX_QUESTION_INTONATION,
+) -> str:
+    runtime_instruction = build_runtime_instruction_text(
+        text=text,
+        instruct_text=instruct_text,
+        instructions=instructions,
+        fix_question_intonation=fix_question_intonation,
+    )
+    if runtime_instruction and mode == "zero_shot":
+        return "instruct2"
+    return mode
 
 
 def is_supported_reference_audio(path: Path) -> bool:
@@ -581,8 +672,13 @@ def print_run_summary(
         print(f"Reference audio: {run.reference.audio_path}")
     print(f"Reference text source: {run.reference.prompt_source_label}")
     print(f"Model dir: {model_options.model_dir}")
-    print(f"Mode: {options.mode}")
+    if options.requested_mode and options.requested_mode != options.mode:
+        reason = options.mode_reason or "automatic runtime rule"
+        print(f"Mode: {options.mode} (requested {options.requested_mode}; promoted because {reason})")
+    else:
+        print(f"Mode: {options.mode}")
     print(f"Text frontend: {'enabled' if options.text_frontend else 'disabled'}")
+    print(f"Fix question intonation: {'enabled' if options.fix_question_intonation else 'disabled'}")
     print(f"Speed: {options.speed}")
     print(f"fp16: {'enabled' if model_options.fp16 else 'disabled'}")
     print(f"Text size: {len(run.text)} chars, {word_count} words")
@@ -631,6 +727,27 @@ def main(argv: list[str] | None = None) -> int:
     try:
         run = resolve_cli_inputs(args, parser, shared_dir, output_dir)
         text_frontend = parse_on_off(args.text_frontend)
+        fix_question_intonation = parse_on_off(args.fix_question_intonation)
+        instruct_text = build_runtime_instruction_text(
+            text=run.text,
+            instruct_text=args.instruct_text,
+            instructions=args.instructions,
+            fix_question_intonation=fix_question_intonation,
+        )
+        requested_mode = args.mode
+        mode_reason = resolve_mode_reason(
+            text=run.text,
+            instruct_text=args.instruct_text,
+            instructions=args.instructions,
+            fix_question_intonation=fix_question_intonation,
+        )
+        effective_mode = resolve_effective_mode(
+            requested_mode,
+            text=run.text,
+            instruct_text=args.instruct_text,
+            instructions=args.instructions,
+            fix_question_intonation=fix_question_intonation,
+        )
         model_options = CosyVoiceModelOptions(
             model_dir=model_dir,
             fp16=parse_on_off(args.fp16),
@@ -640,11 +757,14 @@ def main(argv: list[str] | None = None) -> int:
             text_frontend=text_frontend,
         )
         options = CosyVoiceSynthesisOptions(
-            mode=args.mode,
+            mode=effective_mode,
+            requested_mode=requested_mode,
+            mode_reason=mode_reason,
             text_frontend=text_frontend,
             speed=args.speed,
             stream=parse_on_off(args.stream),
-            instruct_text=args.instruct_text,
+            fix_question_intonation=fix_question_intonation,
+            instruct_text=instruct_text,
         )
 
         if options.mode == "zero_shot" and run.reference.audio_path and not (run.reference.prompt_text or "").strip():
