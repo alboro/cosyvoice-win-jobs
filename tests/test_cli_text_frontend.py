@@ -4,16 +4,20 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from cosyvoice_win.cli import (
     CosyVoiceModelOptions,
+    CosyVoiceSynthesisOptions,
     QUESTION_INTONATION_INSTRUCTION,
+    ResolvedReference,
     build_model_kwargs,
     build_runtime_instruction_text,
     ensure_cosyvoice3_prompt_text,
+    iter_synthesis,
     maybe_disable_text_frontend_imports,
     normalize_instruction_text,
     resolve_effective_mode,
@@ -57,14 +61,14 @@ class TestInstructionPromotion(unittest.TestCase):
             "use russian diction",
         )
 
-    def test_zero_shot_with_instructions_is_promoted_to_instruct2(self):
+    def test_zero_shot_with_instructions_stays_zero_shot(self):
         self.assertEqual(
             resolve_effective_mode(
                 "zero_shot",
                 text="Привет.",
                 instructions="Read the target text in Russian.",
             ),
-            "instruct2",
+            "zero_shot",
         )
 
     def test_question_mark_is_ignored_by_default(self):
@@ -73,16 +77,26 @@ class TestInstructionPromotion(unittest.TestCase):
             "zero_shot",
         )
 
-    def test_trailing_question_mark_promotes_when_explicitly_enabled(self):
+    def test_explicit_instruct2_with_instructions_stays_instruct2(self):
         self.assertEqual(
-            resolve_effective_mode("zero_shot", text='Это точно?"', fix_question_intonation=True),
+            resolve_effective_mode(
+                "instruct2",
+                text="hello.",
+                instructions="Read the target text in Russian.",
+            ),
             "instruct2",
         )
 
-    def test_question_mark_before_quote_and_period_still_promotes_when_enabled(self):
+    def test_trailing_question_mark_does_not_auto_promote_when_enabled(self):
+        self.assertEqual(
+            resolve_effective_mode("zero_shot", text='Это точно?"', fix_question_intonation=True),
+            "zero_shot",
+        )
+
+    def test_question_mark_before_quote_and_period_does_not_auto_promote_when_enabled(self):
         self.assertEqual(
             resolve_effective_mode("zero_shot", text='Это точно?".', fix_question_intonation=True),
-            "instruct2",
+            "zero_shot",
         )
 
     def test_question_prompt_is_appended_once_when_enabled(self):
@@ -114,6 +128,40 @@ class TestInstructionPromotion(unittest.TestCase):
             resolve_effective_mode("cross_lingual", text="Это точно?", fix_question_intonation=True),
             "cross_lingual",
         )
+
+    def test_instruct2_does_not_reuse_cached_prompt_text(self):
+        class FakeCosyVoice:
+            def inference_instruct2(self, text, instruct_text, prompt_audio, **kwargs):
+                return {
+                    "text": text,
+                    "instruct_text": instruct_text,
+                    "prompt_audio": prompt_audio,
+                    "kwargs": kwargs,
+                }
+
+        reference = ResolvedReference(
+            audio_path=Path("reference.wav"),
+            prompt_text="Reference transcript must not be used as instruct prompt.",
+            reference_source_label="test",
+            prompt_source_label="test",
+        )
+        options = CosyVoiceSynthesisOptions(
+            mode="instruct2",
+            instruct_text="Read the target text with question intonation.",
+        )
+
+        with patch("cosyvoice_win.cli.load_prompt_audio_16k", return_value="prompt-audio"):
+            result = iter_synthesis(
+                FakeCosyVoice(),
+                text="Target text?",
+                voice_id="cached_voice",
+                reference=reference,
+                options=options,
+            )
+
+        self.assertEqual(result["instruct_text"], "Read the target text with question intonation.")
+        self.assertEqual(result["prompt_audio"], "prompt-audio")
+        self.assertEqual(result["kwargs"]["zero_shot_spk_id"], "")
 
 
 if __name__ == "__main__":

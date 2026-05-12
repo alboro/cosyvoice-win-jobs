@@ -126,7 +126,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--instructions",
         default=None,
-        help="Non-spoken instruction text. In zero_shot mode this auto-promotes the request to instruct2.",
+        help="Instruction text for explicit instruct2 mode. Ignored by zero_shot because instruct2 may leak instructions into speech.",
     )
     parser.add_argument("--instruct-text", default=None, help="Instruction text for CosyVoice2 instruct2 mode.")
     parser.add_argument("--text-frontend", choices=("on", "off"), default="off")
@@ -134,7 +134,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--fix-question-intonation",
         choices=("on", "off"),
         default="on" if DEFAULT_FIX_QUESTION_INTONATION else "off",
-        help="Auto-promote trailing questions to instruct2 and add a hidden question-intonation instruction.",
+        help="Add a hidden question-intonation instruction only when explicit instruct2 mode is used.",
     )
     parser.add_argument("--speed", type=float, default=DEFAULT_SPEED)
     parser.add_argument("--fp16", choices=("on", "off"), default="on" if DEFAULT_FP16 else "off")
@@ -253,14 +253,6 @@ def resolve_effective_mode(
     instructions: str | None = None,
     fix_question_intonation: bool = DEFAULT_FIX_QUESTION_INTONATION,
 ) -> str:
-    runtime_instruction = build_runtime_instruction_text(
-        text=text,
-        instruct_text=instruct_text,
-        instructions=instructions,
-        fix_question_intonation=fix_question_intonation,
-    )
-    if runtime_instruction and mode == "zero_shot":
-        return "instruct2"
     return mode
 
 
@@ -560,7 +552,10 @@ def iter_synthesis(
             text,
             instruct_text,
             prompt_audio,
-            zero_shot_spk_id=voice_id or "",
+            # CosyVoice uses cached spk2info when zero_shot_spk_id is set.
+            # In instruct2 that cached prompt_text would replace instruct_text
+            # and can leak the reference transcript into generated speech.
+            zero_shot_spk_id="",
             stream=options.stream,
             speed=options.speed,
             text_frontend=options.text_frontend,

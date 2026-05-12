@@ -241,16 +241,12 @@ This endpoint returns audio bytes directly. It supports:
 
 The polling jobs API still only stores and returns WAV files.
 
-Question-ending texts have one extra wrapper rule by default:
+`instruct2` is available only when requested explicitly with `"mode":"instruct2"`.
+It is not enabled automatically for `zero_shot` because CosyVoice can leak the
+instruction text into generated speech.
 
-- `fix_question_intonation=true`
-- if a `zero_shot` request ends with `?` or `?"` or similar closing quotes/brackets after `?`
-- the wrapper auto-promotes that request to `instruct2`
-- and injects a hidden instruction telling CosyVoice to read the target text with question intonation
-
-This is meant to compensate for CosyVoice often under-playing question marks in long-form reading.
-
-Send `"fix_question_intonation": false` if you want to disable that behavior for a specific request.
+`fix_question_intonation=true` only appends the question-intonation helper to
+explicit `instruct2` requests. Plain `zero_shot` requests ignore instructions.
 
 ### Poll status
 
@@ -289,14 +285,16 @@ openai_job_status_path = status
 openai_poll_interval = 5
 openai_poll_timeout = 14400
 openai_submit_omit_fields = instructions
-openai_submit_extra_fields = {"mode":"zero_shot","text_frontend":false,"fix_question_intonation":true}
+openai_submit_extra_fields = {"mode":"zero_shot","text_frontend":false}
 ```
 
 If the voice cache already exists on the server, `voice_name` alone is enough. If not, you first seed the cache with a shared `voice.wav + voice.txt` pair or a request that includes uploaded reference audio and `reference_text`.
 
 For CosyVoice3 the wrapper automatically adds the required `<|endofprompt|>` marker to prompt/instruction text before calling the official runtime.
 
-If you send `instructions`, the wrapper auto-promotes a `zero_shot` request to `instruct2` so the instruction stays separate from the spoken `input`.
+If you send `instructions` while `mode=zero_shot`, they are kept in job metadata
+but are not passed to the model. Use `mode=instruct2` only for short experiments,
+not for production audiobook generation.
 
 ## Installation idea
 
