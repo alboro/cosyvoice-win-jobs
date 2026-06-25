@@ -23,6 +23,13 @@ WORKDIR /app
 # This layer is stable unless the upstream repo changes.
 RUN git clone --recursive https://github.com/FunAudioLLM/CosyVoice.git vendor/CosyVoice
 
+# Some old sdists in CosyVoice's requirements (openai-whisper==20231117) import
+# pkg_resources at build time, which setuptools>=81 no longer ships → build fails.
+# Pin setuptools<81 both in this env AND for PEP517 isolated builds (PIP_CONSTRAINT).
+RUN printf 'setuptools<81\nwheel\n' > /opt/pip-constraints.txt
+ENV PIP_CONSTRAINT=/opt/pip-constraints.txt
+RUN pip install --no-cache-dir --upgrade pip "setuptools<81" wheel
+
 # Install pynini first via pip wheel (Python 3.10, linux x86_64).
 # If PyPI wheel is unavailable, install from conda-forge as fallback.
 RUN pip install --no-cache-dir "pynini==2.1.6" || \
