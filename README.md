@@ -61,6 +61,10 @@ Native Windows may work, but I would treat it as the experimental path. WSL2 is 
 ## Features
 
 - polling jobs API: `POST /v1/tts/jobs`, `GET /v1/tts/jobs/{id}`, `GET /v1/tts/jobs/{id}/audio`
+- synchronous synthesis: `POST /v1/audio/speech` (render and return audio in one request, no polling)
+- voice management: `GET /v1/voices` (list), `POST /v1/voices` (register a named voice from an uploaded reference — async, returns `202` and builds the speaker in the background), `GET /v1/voices/{name}` (poll status), `DELETE /v1/voices/{name}` (remove)
+- model unload: `POST /v1/unload` (free the resident model between batches)
+- `response_format` transcoding to `mp3` / `opus` / `ogg` on `/v1/audio/speech` (via ffmpeg)
 - shared voice discovery from `shared/`
 - sidecar prompt text discovery for zero-shot cloning
 - zero-shot speaker caching by `voice` id
@@ -122,6 +126,83 @@ POST /v1/tts/jobs
   "reference_audio_filename": "reference.wav",
   "reference_text": "Точный текст референса."
 }
+```
+
+### Synchronous synthesis (no polling)
+
+Renders and returns the audio in a single request. Accepts the same body as a
+job, plus `response_format` of `wav` (default), `mp3`, `opus`, or `ogg`
+(non-wav formats are transcoded with ffmpeg). Shares the resident model and
+zero-shot speaker cache with the jobs worker.
+
+```cmd
+curl -X POST http://127.0.0.1:8040/v1/audio/speech ^
+  -H "Content-Type: application/json" ^
+  -d "{\"input\":\"Это тестовая фраза.\",\"voice\":\"reference_long\",\"response_format\":\"mp3\"}" ^
+  --output result.mp3
+```
+
+### List voices
+
+```cmd
+curl http://127.0.0.1:8040/v1/voices
+```
+
+Returns the cached voice ids (`.data/voices/`) and the reference prefixes
+discovered under `shared/`.
+
+### Register a new voice
+
+Upload a reference clip once (base64 or data-URI) plus its transcript. Building
+the zero-shot speaker loads the full model, so the call returns **immediately**
+with `status: "registering"` and does the heavy work in the background — the
+client does not wait. After it finishes, synthesis can refer to the voice by
+`voice` id alone (no per-request upload). `reference_text` is required for
+`zero_shot`; set `overwrite: true` to replace an existing voice.
+
+```json
+POST /v1/voices            -> 202 Accepted
+{
+  "name": "anna",
+  "reference_audio_base64": "<base64-or-data-uri>",
+  "filename": "anna.wav",
+  "reference_text": "Точный текст референса.",
+  "mode": "zero_shot",
+  "overwrite": false
+}
+```
+
+Response:
+
+```json
+{ "name": "anna", "status": "registering", "mode": "zero_shot", "status_url": "/v1/voices/anna", "created": true }
+```
+
+### Poll voice status
+
+Poll until `status` is `ready` (usable) or `failed` (see `error`).
+
+```cmd
+curl http://127.0.0.1:8040/v1/voices/anna
+```
+
+```json
+{ "voice": "anna", "status": "ready", "reference_audio": "...", "reference_text_present": true }
+```
+
+### Delete a voice
+
+```cmd
+curl -X DELETE http://127.0.0.1:8040/v1/voices/anna
+```
+
+### Unload the model
+
+Frees the resident CosyVoice model so memory drops back down between batches;
+the next request reloads it lazily.
+
+```cmd
+curl -X POST http://127.0.0.1:8040/v1/unload
 ```
 
 ### Poll status

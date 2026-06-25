@@ -25,19 +25,24 @@ if "fastapi" not in sys.modules:
         def post(self, *args, **kwargs):
             return lambda func: func
 
+        def delete(self, *args, **kwargs):
+            return lambda func: func
+
     sys.modules["fastapi"] = types.SimpleNamespace(
         FastAPI=_DummyFastAPI,
         HTTPException=Exception,
         status=types.SimpleNamespace(
+            HTTP_201_CREATED=201,
             HTTP_202_ACCEPTED=202,
             HTTP_400_BAD_REQUEST=400,
             HTTP_404_NOT_FOUND=404,
             HTTP_409_CONFLICT=409,
+            HTTP_500_INTERNAL_SERVER_ERROR=500,
         ),
     )
 
 if "fastapi.responses" not in sys.modules:
-    sys.modules["fastapi.responses"] = types.SimpleNamespace(FileResponse=object)
+    sys.modules["fastapi.responses"] = types.SimpleNamespace(FileResponse=object, Response=object)
 
 if "pydantic" not in sys.modules:
     class _DummyBaseModel:
@@ -58,6 +63,7 @@ if "cosyvoice_win.cli" not in sys.modules:
         DEFAULT_SPEED=1.0,
         DEFAULT_TEXT_FRONTEND=False,
         PROJECT_ROOT=FAKE_PROJECT_ROOT,
+        REFERENCE_AUDIO_EXTENSIONS={".wav", ".mp3", ".m4a", ".flac", ".ogg", ".opus", ".aac"},
         CosyVoiceModelOptions=lambda **kwargs: kwargs,
         CosyVoiceSynthesisOptions=lambda **kwargs: kwargs,
         ResolvedReference=lambda **kwargs: types.SimpleNamespace(**kwargs),
@@ -182,6 +188,126 @@ class TestVoiceStore(unittest.TestCase):
             loaded = store.get("reference_long")
             self.assertEqual(loaded["voice"], "reference_long")
             self.assertTrue(loaded["reference_text_present"])
+
+    def test_delete_removes_profile_and_reference_audio(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = VoiceStore(Path(temp_dir))
+            store.put("narrator", {"voice": "narrator"})
+            audio = store.reference_path("narrator", ".wav")
+            audio.write_bytes(b"RIFF")
+
+            self.assertTrue(store.profile_path("narrator").exists())
+            self.assertTrue(audio.exists())
+
+            deleted = store.delete("narrator")
+
+            self.assertTrue(deleted)
+            self.assertFalse(store.profile_path("narrator").exists())
+            self.assertFalse(audio.exists())
+            self.assertFalse(store.delete("narrator"))
+
+    def test_clear_reference_audio_keeps_profile(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = VoiceStore(Path(temp_dir))
+            store.put("narrator", {"voice": "narrator"})
+            store.reference_path("narrator", ".m4a").write_bytes(b"x")
+
+            store.clear_reference_audio("narrator")
+
+            self.assertTrue(store.profile_path("narrator").exists())
+            self.assertFalse(store.reference_path("narrator", ".m4a").exists())
+
+
+class TestVoiceRegistrar(unittest.TestCase):
+    def test_marks_ready_on_success(self):
+        from cosyvoice_win.server import VoiceRegistrar
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            voices = VoiceStore(Path(temp_dir))
+            voices.put("anna", {"voice": "anna", "status": "registering", "error": None})
+
+            class FakeWorker:
+                def register_voice(self, *, voice_id, reference_audio, reference_text, mode):
+                    # mimic _prepare_voice rewriting the profile on success
+                    voices.put(voice_id, {"voice": voice_id, "reference_audio": str(reference_audio)})
+                    return voices.profile_path(voice_id)
+
+            registrar = VoiceRegistrar(FakeWorker(), voices)
+            registrar._register("anna", Path(temp_dir) / "anna.wav", "transcript", "zero_shot")
+
+            profile = voices.get("anna")
+            self.assertEqual(profile["status"], "ready")
+            self.assertIsNone(profile["error"])
+
+    def test_marks_failed_on_error(self):
+        from cosyvoice_win.server import VoiceRegistrar
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            voices = VoiceStore(Path(temp_dir))
+            voices.put("anna", {"voice": "anna", "status": "registering", "error": None})
+
+            class FakeWorker:
+                def register_voice(self, **kwargs):
+                    raise RuntimeError("boom")
+
+            registrar = VoiceRegistrar(FakeWorker(), voices)
+            registrar._register("anna", Path(temp_dir) / "anna.wav", "transcript", "zero_shot")
+
+            profile = voices.get("anna")
+            self.assertEqual(profile["status"], "failed")
+            self.assertEqual(profile["error"], "boom")
+
+
+class TestResponseFormat(unittest.TestCase):
+    def test_encode_output_wav_passthrough(self):
+        from cosyvoice_win.server import encode_output
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            wav = Path(temp_dir) / "a.wav"
+            wav.write_bytes(b"RIFFwavbytes")
+            content, media_type, filename = encode_output(wav, "wav")
+            self.assertEqual(content, b"RIFFwavbytes")
+            self.assertEqual(media_type, "audio/wav")
+            self.assertEqual(filename, "speech.wav")
+
+    def test_direct_response_formats_include_transcodes(self):
+        from cosyvoice_win.server import DIRECT_RESPONSE_FORMATS
+
+        self.assertEqual(DIRECT_RESPONSE_FORMATS, {"wav", "mp3", "opus", "ogg"})
+
+    def test_encode_output_opus_transcodes(self):
+        import shutil
+        import wave
+
+        if shutil.which("ffmpeg") is None:
+            self.skipTest("ffmpeg not available")
+        from cosyvoice_win.server import encode_output
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            wav = Path(temp_dir) / "a.wav"
+            with wave.open(str(wav), "wb") as handle:
+                handle.setnchannels(1)
+                handle.setsampwidth(2)
+                handle.setframerate(24000)
+                handle.writeframes(b"\x00\x01" * 4800)  # 0.2s of audio
+            content, media_type, filename = encode_output(wav, "opus")
+            self.assertEqual(media_type, "audio/ogg")
+            self.assertEqual(filename, "speech.opus")
+            self.assertTrue(content.startswith(b"OggS"), "expected an Ogg stream")
+
+
+class TestBuildRequestPayload(unittest.TestCase):
+    def test_payload_matches_prepare_voice_keys(self):
+        from cosyvoice_win.server import build_request_payload
+
+        payload = build_request_payload(
+            DummyRequest(input="hello", voice="narrator", mode="zero_shot", reference_text="exact")
+        )
+        self.assertEqual(payload["input"], "hello")
+        self.assertEqual(payload["voice"], "narrator")
+        self.assertEqual(payload["mode"], "zero_shot")
+        self.assertEqual(payload["reference_text"], "exact")
+        self.assertEqual(payload["metadata"], {})
 
 
 if __name__ == "__main__":

@@ -5,8 +5,10 @@ import base64
 import binascii
 import json
 import logging
+import os
 import queue
 import shutil
+import tempfile
 import threading
 import time
 import uuid
@@ -17,8 +19,8 @@ from pathlib import Path
 from typing import Any
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, status
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 
 from cosyvoice_win.cli import (
@@ -30,6 +32,7 @@ from cosyvoice_win.cli import (
     DEFAULT_SPEED,
     DEFAULT_TEXT_FRONTEND,
     PROJECT_ROOT,
+    REFERENCE_AUDIO_EXTENSIONS,
     CosyVoiceModelOptions,
     CosyVoiceSynthesisOptions,
     ResolvedReference,
@@ -87,6 +90,20 @@ class CreateTTSJobRequest(BaseModel):
     metadata: dict[str, Any] | None = None
 
 
+class RegisterVoiceRequest(BaseModel):
+    """One-time registration of a named voice. Upload a reference clip once
+    (base64 or data-URI) plus its transcript; the server builds the zero-shot
+    speaker, stores the reference under ``.data/voices/``, and writes a profile.
+    Synthesis requests then refer to it by ``voice`` id alone."""
+
+    name: str = Field(..., min_length=1)
+    reference_audio_base64: str = Field(..., min_length=1)
+    reference_text: str | None = None
+    filename: str | None = None
+    mode: str | None = Field(default=None, pattern="^(zero_shot|cross_lingual)$")
+    overwrite: bool = False
+
+
 @dataclass(slots=True)
 class ServerSettings:
     host: str = DEFAULT_SERVER_HOST
@@ -106,6 +123,7 @@ class ServerSettings:
     job_retention_hours: int = DEFAULT_JOB_RETENTION_HOURS
     downloaded_job_retention_hours: int = DEFAULT_DOWNLOADED_JOB_RETENTION_HOURS
     cleanup_interval_seconds: int = DEFAULT_CLEANUP_INTERVAL_SECONDS
+    api_key: str = ""
 
 
 @dataclass(slots=True)
@@ -318,10 +336,18 @@ class VoiceStore:
         self.voices_dir = voices_dir
         self.voices_dir.mkdir(parents=True, exist_ok=True)
 
+    @staticmethod
+    def _safe(voice_id: str) -> str:
+        safe_name = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in (voice_id or "")).strip("_")
+        return safe_name or "reference"
+
     def profile_path(self, voice_id: str) -> Path:
-        safe_name = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in voice_id).strip("_")
-        safe_name = safe_name or "reference"
-        return self.voices_dir / f"{safe_name}.json"
+        return self.voices_dir / f"{self._safe(voice_id)}.json"
+
+    def reference_path(self, voice_id: str, suffix: str) -> Path:
+        """Stable location for a registered voice's reference audio, kept next to
+        its profile so the speaker cache can be rebuilt after a restart."""
+        return self.voices_dir / f"{self._safe(voice_id)}{suffix}"
 
     def get(self, voice_id: str) -> dict[str, Any] | None:
         path = self.profile_path(voice_id)
@@ -333,6 +359,22 @@ class VoiceStore:
         path = self.profile_path(voice_id)
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         return path
+
+    def clear_reference_audio(self, voice_id: str) -> None:
+        safe = self._safe(voice_id)
+        for path in self.voices_dir.glob(f"{safe}.*"):
+            if path.suffix.lower() != ".json":
+                path.unlink()
+
+    def delete(self, voice_id: str) -> bool:
+        """Remove a voice profile and its stored reference audio. Returns whether
+        a profile existed."""
+        profile = self.profile_path(voice_id)
+        existed = profile.is_file()
+        if existed:
+            profile.unlink()
+        self.clear_reference_audio(voice_id)
+        return existed
 
     def count(self) -> int:
         return sum(1 for _ in self.voices_dir.glob("*.json"))
@@ -383,6 +425,10 @@ class SynthesisWorker:
         self._seeded_voice_ids: set[str] = set()
         self._startup_lock = threading.Lock()
         self._started = False
+        # CosyVoice is one resident, non-re-entrant torch model. The polling worker
+        # thread and the synchronous /v1/audio/speech endpoint (FastAPI threadpool)
+        # can both reach it, so all inference/unload is serialized here.
+        self._infer_lock = threading.Lock()
 
     def start(self) -> None:
         with self._startup_lock:
@@ -419,6 +465,92 @@ class SynthesisWorker:
         self._loaded_model = LoadedModel(tts=tts, load_seconds=time.perf_counter() - started)
         return self._loaded_model
 
+    def synthesize_request(
+        self,
+        request: "CreateTTSJobRequest",
+        *,
+        output_path: Path,
+        uploaded_reference: Path | None = None,
+    ) -> int:
+        """Synchronously render one request to ``output_path`` using the shared
+        resident model. Powers ``POST /v1/audio/speech`` (no polling). Serialized
+        with the polling worker via ``_infer_lock``."""
+        payload = build_request_payload(request)
+        voice_id = str(payload["voice"]).strip() or "reference"
+        options = self._build_job_synthesis_options(payload)
+        with self._infer_lock:
+            loaded_model = self._ensure_model()
+            reference, _ = self._prepare_voice(
+                loaded_model.tts,
+                voice_id=voice_id,
+                uploaded_reference=uploaded_reference,
+                payload=payload,
+            )
+            return synthesize_to_file(
+                loaded_model.tts,
+                text=str(payload["input"]).strip(),
+                voice_id=voice_id,
+                reference=reference,
+                output_path=output_path,
+                options=options,
+            )
+
+    def unload(self) -> list[str]:
+        """Drop the resident CosyVoice model so RSS/VRAM falls back down. Clients
+        call this when a batch finishes; the next request reloads it lazily."""
+        import gc as _gc
+
+        with self._infer_lock:
+            freed: list[str] = []
+            if self._loaded_model is not None:
+                self._loaded_model = None
+                self._seeded_voice_ids.clear()
+                freed.append("cosyvoice")
+            _gc.collect()
+            try:
+                import torch
+
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+            return freed
+
+    def register_voice(
+        self,
+        *,
+        voice_id: str,
+        reference_audio: Path,
+        reference_text: str | None,
+        mode: str,
+    ) -> Path:
+        """Build (or rebuild) the zero-shot speaker for ``voice_id`` from a stored
+        reference and persist its profile, so later requests can synthesize by id
+        alone. Powers ``POST /v1/voices``."""
+        payload = {
+            "input": "",
+            "voice": voice_id,
+            "mode": mode,
+            "text_frontend": None,
+            "speed": None,
+            "reference_text": reference_text,
+            "force_rebuild_voice": True,
+        }
+        with self._infer_lock:
+            loaded_model = self._ensure_model()
+            _, profile_path = self._prepare_voice(
+                loaded_model.tts,
+                voice_id=voice_id,
+                uploaded_reference=reference_audio,
+                payload=payload,
+            )
+        if profile_path is None:
+            raise RuntimeError(f"Failed to register voice '{voice_id}': speaker cache was not created.")
+        return profile_path
+
+    def forget_voice(self, voice_id: str) -> None:
+        self._seeded_voice_ids.discard(voice_id)
+
     def _process_job(self, job_id: str) -> None:
         job = self.store.get_job(job_id)
         if job is None:
@@ -431,10 +563,6 @@ class SynthesisWorker:
                 self.store.update_job(job_id, status="in_progress", started_at=started_at)
                 log_line(log_file, f"Job {job_id} started at {started_at}")
 
-                with redirect_stdout(log_file), redirect_stderr(log_file):
-                    loaded_model = self._ensure_model()
-                log_line(log_file, f"Model ready in {loaded_model.load_seconds:.2f}s")
-
                 payload = self._load_job_request_payload(job_id)
                 voice_id = str(payload["voice"]).strip() or "reference"
                 options = self._build_job_synthesis_options(payload)
@@ -443,21 +571,28 @@ class SynthesisWorker:
                 runtime_started = time.perf_counter()
                 synthesis_started = time.perf_counter()
 
-                with redirect_stdout(log_file), redirect_stderr(log_file):
-                    reference, voice_profile_path = self._prepare_voice(
-                        loaded_model.tts,
-                        voice_id=voice_id,
-                        job_id=job_id,
-                        payload=payload,
-                    )
-                    segments_returned = synthesize_to_file(
-                        loaded_model.tts,
-                        text=str(payload["input"]).strip(),
-                        voice_id=voice_id,
-                        reference=reference,
-                        output_path=output_path,
-                        options=options,
-                    )
+                # Serialize against the synchronous /v1/audio/speech endpoint and
+                # /v1/unload: the resident CosyVoice model is not re-entrant.
+                with self._infer_lock:
+                    with redirect_stdout(log_file), redirect_stderr(log_file):
+                        loaded_model = self._ensure_model()
+                    log_line(log_file, f"Model ready in {loaded_model.load_seconds:.2f}s")
+
+                    with redirect_stdout(log_file), redirect_stderr(log_file):
+                        reference, voice_profile_path = self._prepare_voice(
+                            loaded_model.tts,
+                            voice_id=voice_id,
+                            uploaded_reference=self.store.uploaded_reference_path(job_id),
+                            payload=payload,
+                        )
+                        segments_returned = synthesize_to_file(
+                            loaded_model.tts,
+                            text=str(payload["input"]).strip(),
+                            voice_id=voice_id,
+                            reference=reference,
+                            output_path=output_path,
+                            options=options,
+                        )
 
                 synthesis_seconds = time.perf_counter() - synthesis_started
                 wall_seconds = time.perf_counter() - runtime_started
@@ -501,10 +636,9 @@ class SynthesisWorker:
             stream=False,
         )
 
-    def _prepare_voice(self, cosyvoice_model, *, voice_id: str, job_id: str, payload: dict[str, Any]) -> tuple[ResolvedReference, Path | None]:
+    def _prepare_voice(self, cosyvoice_model, *, voice_id: str, uploaded_reference: Path | None, payload: dict[str, Any]) -> tuple[ResolvedReference, Path | None]:
         force_rebuild = bool(payload.get("force_rebuild_voice"))
         profile = self.voices.get(voice_id)
-        uploaded_reference = self.store.uploaded_reference_path(job_id)
 
         shared_audio: Path | None = None
         shared_text: str | None = None
@@ -607,18 +741,78 @@ class SynthesisWorker:
         )
 
 
+class VoiceRegistrar:
+    """Runs voice registration off the request thread. ``POST /v1/voices`` writes
+    a ``status: "registering"`` profile and returns immediately; this single
+    background worker then builds the zero-shot speaker (a heavy, model-loading
+    step) and flips the profile to ``ready`` or ``failed``. Clients poll
+    ``GET /v1/voices/{name}`` for the outcome."""
+
+    def __init__(self, worker: SynthesisWorker, voices: VoiceStore):
+        self.worker = worker
+        self.voices = voices
+        self._queue: queue.Queue[tuple[str, Path, str | None, str]] = queue.Queue()
+        self._thread = threading.Thread(target=self._run, name="cosyvoice-voice-registrar", daemon=True)
+        self._started = False
+        self._startup_lock = threading.Lock()
+
+    def start(self) -> None:
+        with self._startup_lock:
+            if self._started:
+                return
+            self._thread.start()
+            self._started = True
+
+    def submit(self, *, voice_id: str, reference_audio: Path, reference_text: str | None, mode: str) -> None:
+        self._queue.put((voice_id, reference_audio, reference_text, mode))
+
+    def _run(self) -> None:
+        while True:
+            voice_id, reference_audio, reference_text, mode = self._queue.get()
+            try:
+                self._register(voice_id, reference_audio, reference_text, mode)
+            finally:
+                self._queue.task_done()
+
+    def _register(self, voice_id: str, reference_audio: Path, reference_text: str | None, mode: str) -> None:
+        try:
+            self.worker.register_voice(
+                voice_id=voice_id,
+                reference_audio=reference_audio,
+                reference_text=reference_text,
+                mode=mode,
+            )
+            # register_voice rewrote the profile via _prepare_voice; stamp it ready.
+            self._mark(voice_id, status="ready", error=None)
+            logger.info("Registered voice '%s'.", voice_id)
+        except Exception as exc:  # keep a failed profile so the client can see why
+            self._mark(voice_id, status="failed", error=str(exc))
+            logger.warning("Voice registration failed for '%s': %s", voice_id, exc)
+
+    def _mark(self, voice_id: str, *, status: str, error: str | None) -> None:
+        profile = self.voices.get(voice_id) or {"voice": voice_id}
+        profile["status"] = status
+        profile["error"] = error
+        profile["updated_at"] = utcnow_iso()
+        self.voices.put(voice_id, profile)
+
+
 def parse_args(argv: list[str] | None = None) -> ServerSettings:
     parser = argparse.ArgumentParser(
         prog="cosyvoice-win-server",
-        description="Async polling jobs server for CosyVoice2.",
+        description="Async polling jobs server for CosyVoice.",
     )
-    parser.add_argument("--host", default=DEFAULT_SERVER_HOST)
-    parser.add_argument("--port", type=int, default=DEFAULT_SERVER_PORT)
-    parser.add_argument("--shared-dir", default=str(DEFAULT_SHARED_DIR))
-    parser.add_argument("--jobs-dir", default=str(DEFAULT_JOBS_DIR))
-    parser.add_argument("--voices-dir", default=str(DEFAULT_VOICES_DIR))
-    parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
-    parser.add_argument("--model-dir", default=str(DEFAULT_MODEL_DIR))
+    parser.add_argument("--host", default=os.environ.get("COSYVOICE_HOST", DEFAULT_SERVER_HOST))
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.environ.get("COSYVOICE_PORT", str(DEFAULT_SERVER_PORT))),
+    )
+    parser.add_argument("--shared-dir", default=os.environ.get("COSYVOICE_SHARED_DIR", str(DEFAULT_SHARED_DIR)))
+    parser.add_argument("--jobs-dir", default=os.environ.get("COSYVOICE_JOBS_DIR", str(DEFAULT_JOBS_DIR)))
+    parser.add_argument("--voices-dir", default=os.environ.get("COSYVOICE_VOICES_DIR", str(DEFAULT_VOICES_DIR)))
+    parser.add_argument("--model-id", default=os.environ.get("COSYVOICE_MODEL_ID", DEFAULT_MODEL_ID))
+    parser.add_argument("--model-dir", default=os.environ.get("COSYVOICE_MODEL_DIR", str(DEFAULT_MODEL_DIR)))
     parser.add_argument("--mode", choices=("zero_shot", "cross_lingual"), default=DEFAULT_MODE)
     parser.add_argument(
         "--text-frontend",
@@ -637,6 +831,7 @@ def parse_args(argv: list[str] | None = None) -> ServerSettings:
         default=DEFAULT_DOWNLOADED_JOB_RETENTION_HOURS,
     )
     parser.add_argument("--cleanup-interval-seconds", type=int, default=DEFAULT_CLEANUP_INTERVAL_SECONDS)
+    parser.add_argument("--api-key", default=os.environ.get("COSYVOICE_API_KEY", ""))
     args = parser.parse_args(argv)
     return ServerSettings(
         host=args.host,
@@ -656,6 +851,7 @@ def parse_args(argv: list[str] | None = None) -> ServerSettings:
         job_retention_hours=max(args.job_retention_hours, 0),
         downloaded_job_retention_hours=max(args.downloaded_job_retention_hours, 0),
         cleanup_interval_seconds=max(args.cleanup_interval_seconds, 1),
+        api_key=args.api_key,
     )
 
 
@@ -669,11 +865,13 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
     store = JobStore(server_settings.jobs_dir)
     voices = VoiceStore(server_settings.voices_dir)
     worker = SynthesisWorker(server_settings, store, voices)
+    registrar = VoiceRegistrar(worker, voices)
     gc = JobGarbageCollector(server_settings, store)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         worker.start()
+        registrar.start()
         gc.start()
         yield
         gc.stop()
@@ -683,7 +881,22 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
     app.state.store = store
     app.state.voices = voices
     app.state.worker = worker
+    app.state.registrar = registrar
     app.state.gc = gc
+
+    # Auth: if COSYVOICE_API_KEY is set, require "Authorization: Bearer <key>" (or
+    # "X-Api-Key: <key>") on all /v1/* routes. /health is always open (used by deploy).
+    _api_key = server_settings.api_key or None
+    if _api_key:
+        @app.middleware("http")
+        async def _bearer_auth(request: Request, call_next):
+            if request.url.path.startswith("/v1"):
+                auth = request.headers.get("Authorization", "")
+                x_key = request.headers.get("X-Api-Key", "")
+                if auth == f"Bearer {_api_key}" or x_key == _api_key:
+                    return await call_next(request)
+                return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+            return await call_next(request)
 
     @app.get("/health")
     def health() -> dict[str, Any]:
@@ -703,6 +916,190 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
             "job_retention_hours": server_settings.job_retention_hours,
             "downloaded_job_retention_hours": server_settings.downloaded_job_retention_hours,
         }
+
+    @app.get("/v1/voices")
+    def list_voices() -> dict[str, Any]:
+        cached = (
+            sorted(path.stem for path in server_settings.voices_dir.glob("*.json"))
+            if server_settings.voices_dir.is_dir()
+            else []
+        )
+        shared = sorted(
+            {
+                path.stem
+                for path in server_settings.shared_dir.rglob("*")
+                if path.is_file() and path.suffix.lower() in REFERENCE_AUDIO_EXTENSIONS
+            }
+        )
+        return {
+            "model": server_settings.model_id,
+            "mode": server_settings.mode,
+            "cached_voices": cached,
+            "shared_references": shared,
+        }
+
+    @app.post("/v1/voices", status_code=status.HTTP_202_ACCEPTED)
+    def register_voice(request: RegisterVoiceRequest) -> dict[str, Any]:
+        """Register a named voice from an uploaded reference. Building the zero-shot
+        speaker loads the full model, so this returns immediately with
+        ``status: "registering"`` and queues the work; poll ``status_url`` for the
+        outcome (``ready`` / ``failed``). Synthesis then refers to the voice by
+        ``voice`` id (no per-request upload needed)."""
+        name = safe_voice_name(request.name)
+        mode = request.mode or server_settings.mode
+        reference_text = (request.reference_text or "").strip()
+        if mode == "zero_shot" and not reference_text:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="zero_shot voices require reference_text matching the reference audio.",
+            )
+
+        existing = voices.get(name)
+        if existing is not None and not request.overwrite:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Voice '{name}' already exists. Set overwrite=true to replace it.",
+            )
+        if existing is not None and existing.get("status") == "registering":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Voice '{name}' is already being registered.",
+            )
+
+        try:
+            data = decode_audio_base64(request.reference_audio_base64)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+        suffix = infer_reference_suffix(request.filename, None)
+        voices.clear_reference_audio(name)
+        reference_path = voices.reference_path(name, suffix)
+        reference_path.write_bytes(data)
+
+        now = utcnow_iso()
+        voices.put(
+            name,
+            {
+                "voice": name,
+                "status": "registering",
+                "error": None,
+                "mode": mode,
+                "reference_audio": str(reference_path),
+                "reference_text": reference_text,
+                "reference_text_present": bool(reference_text),
+                "created_at": now,
+                "updated_at": now,
+            },
+        )
+        registrar.submit(
+            voice_id=name,
+            reference_audio=reference_path,
+            reference_text=reference_text or None,
+            mode=mode,
+        )
+
+        return {
+            "name": name,
+            "status": "registering",
+            "mode": mode,
+            "status_url": f"/v1/voices/{name}",
+            "created": existing is None,
+        }
+
+    @app.get("/v1/voices/{name}")
+    def get_voice(name: str) -> dict[str, Any]:
+        profile = voices.get(safe_voice_name(name))
+        if profile is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Voice not found.")
+        return profile
+
+    @app.delete("/v1/voices/{name}")
+    def delete_voice(name: str) -> dict[str, Any]:
+        safe = safe_voice_name(name)
+        deleted = voices.delete(safe)
+        worker.forget_voice(safe)
+        return {"name": safe, "deleted": deleted}
+
+    @app.post("/v1/audio/speech")
+    def create_speech(request: CreateTTSJobRequest) -> Response:
+        """Synchronous, single-shot synthesis: render and return the audio in one
+        request instead of polling a job. Shares the resident model and voice cache
+        with the jobs worker."""
+        if request.model != server_settings.model_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Only model '{server_settings.model_id}' is currently supported.",
+            )
+
+        fmt = request.response_format.lower()
+        if fmt not in DIRECT_RESPONSE_FORMATS:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Supported response_format values: " + ", ".join(sorted(DIRECT_RESPONSE_FORMATS)) + ".",
+            )
+
+        text = request.input.strip()
+        if not text:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="input must not be empty.")
+
+        voice_id = (request.voice or "reference").strip() or "reference"
+        normalized = CreateTTSJobRequest(
+            input=text,
+            model=request.model,
+            voice=voice_id,
+            response_format=fmt,
+            mode=request.mode or server_settings.mode,
+            text_frontend=_pick_override(request.text_frontend, server_settings.text_frontend),
+            speed=_pick_override(request.speed, server_settings.speed),
+            reference_audio_base64=request.reference_audio_base64,
+            reference_audio_filename=request.reference_audio_filename,
+            reference_text=(request.reference_text or "").strip() or None,
+            force_rebuild_voice=bool(request.force_rebuild_voice),
+            metadata=request.metadata,
+        )
+
+        with tempfile.TemporaryDirectory(prefix="cosyvoice-direct-") as tmp:
+            tmp_dir = Path(tmp)
+            uploaded_reference: Path | None = None
+            if normalized.reference_audio_base64:
+                try:
+                    uploaded_reference = decode_reference_audio_to_file(
+                        encoded=normalized.reference_audio_base64,
+                        filename=normalized.reference_audio_filename,
+                        job_dir=tmp_dir,
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+            output_path = tmp_dir / DEFAULT_JOB_OUTPUT_NAME
+            try:
+                worker.synthesize_request(
+                    normalized,
+                    output_path=output_path,
+                    uploaded_reference=uploaded_reference,
+                )
+                content, media_type, filename = encode_output(output_path, fmt)
+            except HTTPException:
+                raise
+            except ValueError as exc:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+            except Exception as exc:
+                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
+
+        return Response(
+            content=content,
+            media_type=media_type,
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "X-Voice": voice_id,
+            },
+        )
+
+    @app.post("/v1/unload")
+    def unload() -> dict[str, Any]:
+        """Free the resident CosyVoice model so memory drops back down. Clients
+        call this at the end of a batch; the next request reloads it lazily."""
+        return {"unloaded": worker.unload()}
 
     @app.post("/v1/tts/jobs", status_code=status.HTTP_202_ACCEPTED)
     def create_tts_job(request: CreateTTSJobRequest) -> dict[str, Any]:
@@ -787,6 +1184,22 @@ def decode_reference_audio_to_file(encoded: str, filename: str | None, job_dir: 
     return reference_path
 
 
+def decode_audio_base64(value: str) -> bytes:
+    """Decode a base64 / data-URI audio payload to raw bytes."""
+    _, payload = split_data_uri(value)
+    try:
+        return base64.b64decode(payload, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("reference_audio_base64 is not valid base64.") from exc
+
+
+def safe_voice_name(name: str) -> str:
+    cleaned = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in (name or "")).strip("_")
+    if not cleaned:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid voice name.")
+    return cleaned
+
+
 def split_data_uri(value: str) -> tuple[str | None, str]:
     normalized = value.strip()
     if normalized.startswith("data:"):
@@ -834,6 +1247,59 @@ def _pick_override(value: Any, default: Any) -> Any:
     return default if value is None else value
 
 
+def build_request_payload(request: "CreateTTSJobRequest") -> dict[str, Any]:
+    """Flatten a request model into the dict shape ``_prepare_voice`` and
+    ``_build_job_synthesis_options`` consume (the same keys ``create_job`` writes
+    to request.json), so the polling worker and the sync endpoint share one path."""
+    return {
+        "input": request.input,
+        "model": request.model,
+        "voice": request.voice,
+        "response_format": request.response_format,
+        "mode": request.mode,
+        "text_frontend": request.text_frontend,
+        "speed": request.speed,
+        "reference_text": request.reference_text,
+        "force_rebuild_voice": request.force_rebuild_voice,
+        "metadata": request.metadata or {},
+    }
+
+
+# CosyVoice renders WAV; everything else is an ffmpeg transcode. Keys are the
+# response_format values the synchronous /v1/audio/speech endpoint accepts.
+# Value: (ffmpeg args, mime, download filename). wav is handled separately.
+_FFMPEG_OUTPUTS: dict[str, tuple[list[str], str, str]] = {
+    "mp3": (["-codec:a", "libmp3lame", "-q:a", "4", "-f", "mp3"], "audio/mpeg", "speech.mp3"),
+    "opus": (["-codec:a", "libopus", "-b:a", "48k", "-f", "ogg"], "audio/ogg", "speech.opus"),
+    "ogg": (["-codec:a", "libvorbis", "-q:a", "4", "-f", "ogg"], "audio/ogg", "speech.ogg"),
+}
+DIRECT_RESPONSE_FORMATS = {"wav", *_FFMPEG_OUTPUTS}
+
+
+def encode_output(wav_path: Path, response_format: str | None) -> tuple[bytes, str, str]:
+    """Return the rendered WAV as-is, or transcode it (mp3/opus/ogg) via ffmpeg.
+    Returns (bytes, media_type, download_filename)."""
+    fmt = (response_format or "wav").lower()
+    spec = _FFMPEG_OUTPUTS.get(fmt)
+    if spec is None:
+        return wav_path.read_bytes(), "audio/wav", "speech.wav"
+    encoder_args, media_type, filename = spec
+    return ffmpeg_transcode(wav_path, encoder_args, fmt), media_type, filename
+
+
+def ffmpeg_transcode(wav_path: Path, encoder_args: list[str], fmt: str) -> bytes:
+    import subprocess
+
+    proc = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(wav_path), *encoder_args, "pipe:1"],
+        capture_output=True,
+    )
+    if proc.returncode != 0 or not proc.stdout:
+        detail = proc.stderr.decode("utf-8", "replace").strip()[:500]
+        raise RuntimeError(f"ffmpeg wav->{fmt} transcode failed: {detail or 'no output'}")
+    return proc.stdout
+
+
 def main(argv: list[str] | None = None) -> int:
     settings = parse_args(argv)
     app = create_app(settings)
@@ -841,7 +1307,7 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-app = create_app()
+app = create_app(parse_args([]))
 
 
 if __name__ == "__main__":

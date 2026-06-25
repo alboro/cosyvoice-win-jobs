@@ -14,7 +14,7 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_SHARED_DIR = PROJECT_ROOT / "shared"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "output"
-DEFAULT_MODEL_ID = "CosyVoice2-0.5B"
+DEFAULT_MODEL_ID = "Fun-CosyVoice3-0.5B"
 DEFAULT_MODEL_DIR = PROJECT_ROOT / "pretrained_models" / DEFAULT_MODEL_ID
 DEFAULT_REFERENCE_PREFIX = "reference"
 DEFAULT_MODE = "zero_shot"
