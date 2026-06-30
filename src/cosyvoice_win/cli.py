@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
-import re
+import random
 import shutil
 import sys
 import time
@@ -25,16 +25,11 @@ DEFAULT_SPEED = 1.0
 DEFAULT_TEXT_FRONTEND = False
 DEFAULT_FP16 = True
 DEFAULT_STREAM = False
-DEFAULT_FIX_QUESTION_INTONATION = False
 COSYVOICE3_PROMPT_PREFIX = "You are a helpful assistant.<|endofprompt|>"
 COSYVOICE3_PROMPT_MARKER = "<|endofprompt|>"
-QUESTION_INTONATION_INSTRUCTION = (
-    "Read only the target text with clear question intonation. Do not read the instruction aloud."
-)
-QUESTION_TRAILING_CLOSERS = "\"'`»«“”„‟’‘)]}>】』」"
-QUESTION_ENDING_PATTERN = re.compile(
-    r"\?+(?:[" + re.escape(QUESTION_TRAILING_CLOSERS) + r"]+)?(?:[.,;:!…]+)?\s*$"
-)
+DEFAULT_TEMPERATURE = 1.0
+DEFAULT_TOP_P = 0.8
+DEFAULT_TOP_K = 25
 
 REFERENCE_AUDIO_EXTENSIONS = {
     ".wav",
@@ -85,8 +80,11 @@ class CosyVoiceSynthesisOptions:
     text_frontend: bool = DEFAULT_TEXT_FRONTEND
     speed: float = DEFAULT_SPEED
     stream: bool = DEFAULT_STREAM
-    fix_question_intonation: bool = DEFAULT_FIX_QUESTION_INTONATION
     instruct_text: str | None = None
+    seed: int | None = None
+    temperature: float | None = None
+    top_p: float | None = None
+    top_k: int | None = None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -130,12 +128,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--instruct-text", default=None, help="Instruction text for CosyVoice2 instruct2 mode.")
     parser.add_argument("--text-frontend", choices=("on", "off"), default="off")
-    parser.add_argument(
-        "--fix-question-intonation",
-        choices=("on", "off"),
-        default="on" if DEFAULT_FIX_QUESTION_INTONATION else "off",
-        help="Add a hidden question-intonation instruction only when explicit instruct2 mode is used.",
-    )
     parser.add_argument("--speed", type=float, default=DEFAULT_SPEED)
     parser.add_argument("--fp16", choices=("on", "off"), default="on" if DEFAULT_FP16 else "off")
     parser.add_argument("--load-jit", choices=("on", "off"), default="off")
@@ -204,27 +196,13 @@ def normalize_instruction_text(
     return value or None
 
 
-def ends_with_question_intonation_trigger(text: str) -> bool:
-    return bool(QUESTION_ENDING_PATTERN.search(text.rstrip()))
-
-
 def build_runtime_instruction_text(
     *,
     text: str,
     instruct_text: str | None = None,
     instructions: str | None = None,
-    fix_question_intonation: bool = DEFAULT_FIX_QUESTION_INTONATION,
 ) -> str | None:
-    parts: list[str] = []
-    base_instruction = normalize_instruction_text(instruct_text, instructions)
-    if base_instruction:
-        parts.append(base_instruction)
-    if fix_question_intonation and ends_with_question_intonation_trigger(text):
-        if not base_instruction or QUESTION_INTONATION_INSTRUCTION not in base_instruction:
-            parts.append(QUESTION_INTONATION_INSTRUCTION)
-    if not parts:
-        return None
-    return "\n".join(parts)
+    return normalize_instruction_text(instruct_text, instructions)
 
 
 def resolve_mode_reason(
@@ -232,16 +210,10 @@ def resolve_mode_reason(
     text: str,
     instruct_text: str | None = None,
     instructions: str | None = None,
-    fix_question_intonation: bool = DEFAULT_FIX_QUESTION_INTONATION,
 ) -> str | None:
     has_explicit_instruction = bool(normalize_instruction_text(instruct_text, instructions))
-    has_question_trigger = fix_question_intonation and ends_with_question_intonation_trigger(text)
-    if has_explicit_instruction and has_question_trigger:
-        return "instructions were provided and the input ends with a question mark"
     if has_explicit_instruction:
         return "instructions were provided"
-    if has_question_trigger:
-        return "the input ends with a question mark"
     return None
 
 
@@ -251,7 +223,6 @@ def resolve_effective_mode(
     text: str = "",
     instruct_text: str | None = None,
     instructions: str | None = None,
-    fix_question_intonation: bool = DEFAULT_FIX_QUESTION_INTONATION,
 ) -> str:
     return mode
 
@@ -513,55 +484,62 @@ def iter_synthesis(
     reference: ResolvedReference,
     options: CosyVoiceSynthesisOptions,
 ):
-    prompt_audio = load_prompt_audio_16k(reference.audio_path) if reference.audio_path else ""
-    prompt_text = reference.prompt_text or ""
+    def generate():
+        prompt_audio = load_prompt_audio_16k(reference.audio_path) if reference.audio_path else ""
+        prompt_text = reference.prompt_text or ""
 
-    if options.mode == "zero_shot":
-        prompt_text = ensure_cosyvoice3_prompt_text(cosyvoice_model, prompt_text)
-        return cosyvoice_model.inference_zero_shot(
-            text,
-            prompt_text,
-            prompt_audio,
-            zero_shot_spk_id=voice_id or "",
-            stream=options.stream,
-            speed=options.speed,
-            text_frontend=options.text_frontend,
-        )
+        with generation_controls(cosyvoice_model, options):
+            if options.mode == "zero_shot":
+                prompt_text_with_control = ensure_cosyvoice3_prompt_text(cosyvoice_model, prompt_text)
+                yield from cosyvoice_model.inference_zero_shot(
+                    text,
+                    prompt_text_with_control,
+                    prompt_audio,
+                    zero_shot_spk_id=voice_id or "",
+                    stream=options.stream,
+                    speed=options.speed,
+                    text_frontend=options.text_frontend,
+                )
+                return
 
-    if options.mode == "cross_lingual":
-        text = ensure_cosyvoice3_tts_text(cosyvoice_model, text)
-        return cosyvoice_model.inference_cross_lingual(
-            text,
-            prompt_audio,
-            zero_shot_spk_id=voice_id or "",
-            stream=options.stream,
-            speed=options.speed,
-            text_frontend=options.text_frontend,
-        )
+            if options.mode == "cross_lingual":
+                controlled_text = ensure_cosyvoice3_tts_text(cosyvoice_model, text)
+                yield from cosyvoice_model.inference_cross_lingual(
+                    controlled_text,
+                    prompt_audio,
+                    zero_shot_spk_id=voice_id or "",
+                    stream=options.stream,
+                    speed=options.speed,
+                    text_frontend=options.text_frontend,
+                )
+                return
 
-    if options.mode == "instruct2":
-        if not hasattr(cosyvoice_model, "inference_instruct2"):
-            raise RuntimeError("This CosyVoice runtime does not expose inference_instruct2().")
-        instruct_text = (options.instruct_text or "").strip()
-        if not instruct_text:
-            raise ValueError("instruct2 mode requires instruct_text.")
-        instruct_text = ensure_cosyvoice3_instruct_text(cosyvoice_model, instruct_text)
-        if not prompt_audio:
-            raise ValueError("instruct2 mode requires a reference audio file.")
-        return cosyvoice_model.inference_instruct2(
-            text,
-            instruct_text,
-            prompt_audio,
-            # CosyVoice uses cached spk2info when zero_shot_spk_id is set.
-            # In instruct2 that cached prompt_text would replace instruct_text
-            # and can leak the reference transcript into generated speech.
-            zero_shot_spk_id="",
-            stream=options.stream,
-            speed=options.speed,
-            text_frontend=options.text_frontend,
-        )
+            if options.mode == "instruct2":
+                if not hasattr(cosyvoice_model, "inference_instruct2"):
+                    raise RuntimeError("This CosyVoice runtime does not expose inference_instruct2().")
+                instruct_text = (options.instruct_text or "").strip()
+                if not instruct_text:
+                    raise ValueError("instruct2 mode requires instruct_text.")
+                instruct_text = ensure_cosyvoice3_instruct_text(cosyvoice_model, instruct_text)
+                if not prompt_audio:
+                    raise ValueError("instruct2 mode requires a reference audio file.")
+                yield from cosyvoice_model.inference_instruct2(
+                    text,
+                    instruct_text,
+                    prompt_audio,
+                    # CosyVoice uses cached spk2info when zero_shot_spk_id is set.
+                    # In instruct2 that cached prompt_text would replace instruct_text
+                    # and can leak the reference transcript into generated speech.
+                    zero_shot_spk_id="",
+                    stream=options.stream,
+                    speed=options.speed,
+                    text_frontend=options.text_frontend,
+                )
+                return
 
-    raise ValueError(f"Unsupported mode: {options.mode}")
+            raise ValueError(f"Unsupported mode: {options.mode}")
+
+    return generate()
 
 
 def is_cosyvoice3_model(cosyvoice_model) -> bool:
@@ -584,6 +562,63 @@ def ensure_cosyvoice3_instruct_text(cosyvoice_model, instruct_text: str) -> str:
     if not is_cosyvoice3_model(cosyvoice_model) or COSYVOICE3_PROMPT_MARKER in instruct_text:
         return instruct_text
     return f"You are a helpful assistant. {instruct_text}{COSYVOICE3_PROMPT_MARKER}"
+
+
+def set_all_random_seed(seed: int) -> None:
+    import numpy as np
+    import torch
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def load_ras_sampling():
+    from cosyvoice.utils.common import ras_sampling
+
+    return ras_sampling
+
+
+@contextmanager
+def generation_controls(cosyvoice_model, options: CosyVoiceSynthesisOptions):
+    sampling_requested = any(
+        value is not None
+        for value in (options.temperature, options.top_p, options.top_k)
+    )
+    llm = getattr(getattr(cosyvoice_model, "model", None), "llm", None)
+    if (options.seed is not None or sampling_requested) and llm is not None and hasattr(llm, "vllm"):
+        raise RuntimeError("Per-request seed/temperature/top_p/top_k are not supported with load_vllm=true.")
+
+    original_sampling = None
+    if sampling_requested:
+        if llm is None or not hasattr(llm, "sampling"):
+            raise RuntimeError("This CosyVoice runtime does not expose the native sampling function.")
+        temperature = options.temperature if options.temperature is not None else DEFAULT_TEMPERATURE
+        top_p = options.top_p if options.top_p is not None else DEFAULT_TOP_P
+        top_k = options.top_k if options.top_k is not None else DEFAULT_TOP_K
+        ras_sampling = load_ras_sampling()
+        original_sampling = llm.sampling
+
+        def controlled_sampling(weighted_scores, decoded_tokens, sampling):
+            return ras_sampling(
+                weighted_scores / temperature,
+                decoded_tokens,
+                sampling,
+                top_p=top_p,
+                top_k=top_k,
+            )
+
+        llm.sampling = controlled_sampling
+
+    try:
+        if options.seed is not None:
+            set_all_random_seed(options.seed)
+        yield
+    finally:
+        if original_sampling is not None:
+            llm.sampling = original_sampling
 
 
 def save_outputs_to_wav(outputs, sample_rate: int, output_path: Path) -> None:
@@ -673,7 +708,6 @@ def print_run_summary(
     else:
         print(f"Mode: {options.mode}")
     print(f"Text frontend: {'enabled' if options.text_frontend else 'disabled'}")
-    print(f"Fix question intonation: {'enabled' if options.fix_question_intonation else 'disabled'}")
     print(f"Speed: {options.speed}")
     print(f"fp16: {'enabled' if model_options.fp16 else 'disabled'}")
     print(f"Text size: {len(run.text)} chars, {word_count} words")
@@ -722,26 +756,22 @@ def main(argv: list[str] | None = None) -> int:
     try:
         run = resolve_cli_inputs(args, parser, shared_dir, output_dir)
         text_frontend = parse_on_off(args.text_frontend)
-        fix_question_intonation = parse_on_off(args.fix_question_intonation)
         instruct_text = build_runtime_instruction_text(
             text=run.text,
             instruct_text=args.instruct_text,
             instructions=args.instructions,
-            fix_question_intonation=fix_question_intonation,
         )
         requested_mode = args.mode
         mode_reason = resolve_mode_reason(
             text=run.text,
             instruct_text=args.instruct_text,
             instructions=args.instructions,
-            fix_question_intonation=fix_question_intonation,
         )
         effective_mode = resolve_effective_mode(
             requested_mode,
             text=run.text,
             instruct_text=args.instruct_text,
             instructions=args.instructions,
-            fix_question_intonation=fix_question_intonation,
         )
         model_options = CosyVoiceModelOptions(
             model_dir=model_dir,
@@ -758,7 +788,6 @@ def main(argv: list[str] | None = None) -> int:
             text_frontend=text_frontend,
             speed=args.speed,
             stream=parse_on_off(args.stream),
-            fix_question_intonation=fix_question_intonation,
             instruct_text=instruct_text,
         )
 

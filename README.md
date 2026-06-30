@@ -117,10 +117,27 @@ POST /v1/tts/jobs
   "response_format": "wav",
   "mode": "zero_shot",
   "text_frontend": false,
-  "fix_question_intonation": true,
+  "seed": 12345,
+  "temperature": 1.0,
+  "top_p": 0.8,
+  "top_k": 25,
   "speed": 1.0
 }
 ```
+
+Generation controls are optional and may be changed for every request:
+
+- `seed`: integer from `0` through `4294967295`; reuse it with the same inputs
+  for the most reproducible result, or change it to sample another delivery
+- `temperature`: `> 0` and `<= 2`; lower values are more conservative, higher
+  values are more varied (`1.0` matches upstream behavior)
+- `top_p`: `> 0` and `<= 1` (`0.8` is the upstream RAS default)
+- `top_k`: integer from `1` through `1000` (`25` is the upstream RAS default)
+
+Per-request `seed`, `temperature`, `top_p`, and `top_k` require the native
+CosyVoice sampler (the default). They are rejected when the server is started
+with `--load-vllm on`, because current upstream vLLM integration does not expose
+equivalent per-request controls through the CosyVoice API.
 
 ### Create job with uploaded reference
 
@@ -133,7 +150,7 @@ POST /v1/tts/jobs
   "response_format": "wav",
   "mode": "zero_shot",
   "text_frontend": false,
-  "fix_question_intonation": true,
+  "seed": 12345,
   "speed": 1.0,
   "reference_audio_base64": "<base64-or-data-uri>",
   "reference_audio_filename": "reference.wav",
@@ -228,7 +245,10 @@ POST /v1/audio/speech
   "response_format": "wav",
   "mode": "zero_shot",
   "text_frontend": false,
-  "fix_question_intonation": true,
+  "seed": 12345,
+  "temperature": 1.0,
+  "top_p": 0.8,
+  "top_k": 25,
   "speed": 1.0
 }
 ```
@@ -244,9 +264,6 @@ The polling jobs API still only stores and returns WAV files.
 `instruct2` is available only when requested explicitly with `"mode":"instruct2"`.
 It is not enabled automatically for `zero_shot` because CosyVoice can leak the
 instruction text into generated speech.
-
-`fix_question_intonation=true` only appends the question-intonation helper to
-explicit `instruct2` requests. Plain `zero_shot` requests ignore instructions.
 
 ### Poll status
 

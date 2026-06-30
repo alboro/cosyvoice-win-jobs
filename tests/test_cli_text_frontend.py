@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -12,11 +13,11 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from cosyvoice_win.cli import (
     CosyVoiceModelOptions,
     CosyVoiceSynthesisOptions,
-    QUESTION_INTONATION_INSTRUCTION,
     ResolvedReference,
     build_model_kwargs,
     build_runtime_instruction_text,
     ensure_cosyvoice3_prompt_text,
+    generation_controls,
     iter_synthesis,
     maybe_disable_text_frontend_imports,
     normalize_instruction_text,
@@ -53,6 +54,38 @@ class TestTextFrontendImports(unittest.TestCase):
 
         self.assertEqual(prompt, "You are a helpful assistant.<|endofprompt|>Здравствуйте.")
 
+    def test_generation_controls_apply_seed_and_sampling_then_restore(self):
+        original_sampling = object()
+        llm = SimpleNamespace(sampling=original_sampling)
+        model = type("CosyVoice3", (), {"model": SimpleNamespace(llm=llm)})()
+        options = CosyVoiceSynthesisOptions(seed=123, temperature=0.5, top_p=0.7, top_k=12)
+        calls = []
+
+        def fake_ras(scores, decoded_tokens, sampling, **kwargs):
+            calls.append((scores, decoded_tokens, sampling, kwargs))
+            return 42
+
+        with (
+            patch("cosyvoice_win.cli.load_ras_sampling", return_value=fake_ras),
+            patch("cosyvoice_win.cli.set_all_random_seed") as set_seed,
+        ):
+            with generation_controls(model, options):
+                self.assertIsNot(llm.sampling, original_sampling)
+                self.assertEqual(llm.sampling(4.0, [1, 2], 25), 42)
+                set_seed.assert_called_once_with(123)
+
+        self.assertIs(llm.sampling, original_sampling)
+        self.assertEqual(calls[0][0], 8.0)
+        self.assertEqual(calls[0][3], {"top_p": 0.7, "top_k": 12})
+
+    def test_generation_controls_reject_vllm_specific_overrides(self):
+        llm = SimpleNamespace(sampling=object(), vllm=object())
+        model = type("CosyVoice3", (), {"model": SimpleNamespace(llm=llm)})()
+
+        with self.assertRaisesRegex(RuntimeError, "load_vllm=true"):
+            with generation_controls(model, CosyVoiceSynthesisOptions(seed=123)):
+                pass
+
 
 class TestInstructionPromotion(unittest.TestCase):
     def test_normalize_instruction_text_prefers_explicit_instruct_text(self):
@@ -71,12 +104,6 @@ class TestInstructionPromotion(unittest.TestCase):
             "zero_shot",
         )
 
-    def test_question_mark_is_ignored_by_default(self):
-        self.assertEqual(
-            resolve_effective_mode("zero_shot", text='Это точно?"'),
-            "zero_shot",
-        )
-
     def test_explicit_instruct2_with_instructions_stays_instruct2(self):
         self.assertEqual(
             resolve_effective_mode(
@@ -87,52 +114,10 @@ class TestInstructionPromotion(unittest.TestCase):
             "instruct2",
         )
 
-    def test_trailing_question_mark_does_not_auto_promote_when_enabled(self):
-        self.assertEqual(
-            resolve_effective_mode("zero_shot", text='Это точно?"', fix_question_intonation=True),
-            "zero_shot",
-        )
-
-    def test_question_mark_before_quote_and_period_does_not_auto_promote_when_enabled(self):
-        self.assertEqual(
-            resolve_effective_mode("zero_shot", text='Это точно?".', fix_question_intonation=True),
-            "zero_shot",
-        )
-
-    def test_question_prompt_is_appended_once_when_enabled(self):
-        instruction = build_runtime_instruction_text(text='Это точно?"', fix_question_intonation=True)
-        self.assertEqual(instruction, QUESTION_INTONATION_INSTRUCTION)
-
-        combined = build_runtime_instruction_text(
-            text='Это точно?"',
-            instructions="Speak clearly.",
-            fix_question_intonation=True,
-        )
-        self.assertEqual(
-            combined,
-            "Speak clearly.\n" + QUESTION_INTONATION_INSTRUCTION,
-        )
-
-    def test_trailing_question_mark_does_not_promote_when_disabled(self):
-        self.assertEqual(
-            resolve_effective_mode(
-                "zero_shot",
-                text='Это точно?"',
-                fix_question_intonation=False,
-            ),
-            "zero_shot",
-        )
-
-    def test_cross_lingual_with_question_mark_is_not_auto_promoted(self):
-        self.assertEqual(
-            resolve_effective_mode("cross_lingual", text="Это точно?", fix_question_intonation=True),
-            "cross_lingual",
-        )
-
     def test_instruct2_does_not_reuse_cached_prompt_text(self):
         class FakeCosyVoice:
             def inference_instruct2(self, text, instruct_text, prompt_audio, **kwargs):
-                return {
+                yield {
                     "text": text,
                     "instruct_text": instruct_text,
                     "prompt_audio": prompt_audio,
@@ -151,13 +136,15 @@ class TestInstructionPromotion(unittest.TestCase):
         )
 
         with patch("cosyvoice_win.cli.load_prompt_audio_16k", return_value="prompt-audio"):
-            result = iter_synthesis(
-                FakeCosyVoice(),
-                text="Target text?",
-                voice_id="cached_voice",
-                reference=reference,
-                options=options,
-            )
+            result = list(
+                iter_synthesis(
+                    FakeCosyVoice(),
+                    text="Target text?",
+                    voice_id="cached_voice",
+                    reference=reference,
+                    options=options,
+                )
+            )[0]
 
         self.assertEqual(result["instruct_text"], "Read the target text with question intonation.")
         self.assertEqual(result["prompt_audio"], "prompt-audio")

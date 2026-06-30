@@ -27,7 +27,6 @@ from pydantic import BaseModel, Field
 
 from cosyvoice_win.cli import (
     DEFAULT_FP16,
-    DEFAULT_FIX_QUESTION_INTONATION,
     DEFAULT_MODEL_DIR,
     DEFAULT_MODEL_ID,
     DEFAULT_MODE,
@@ -91,7 +90,10 @@ class CreateTTSJobRequest(BaseModel):
     text_frontend: bool | None = None
     speed: float | None = Field(default=None, gt=0)
     stream: bool | None = None
-    fix_question_intonation: bool | None = None
+    seed: int | None = Field(default=None, ge=0, le=4294967295)
+    temperature: float | None = Field(default=None, gt=0, le=2.0)
+    top_p: float | None = Field(default=None, gt=0, le=1.0)
+    top_k: int | None = Field(default=None, ge=1, le=1000)
     instructions: str | None = None
     instruct_text: str | None = None
     reference_audio_base64: str | None = None
@@ -126,7 +128,6 @@ class ServerSettings:
     model_dir: Path = DEFAULT_MODEL_DIR
     mode: str = DEFAULT_MODE
     text_frontend: bool = DEFAULT_TEXT_FRONTEND
-    fix_question_intonation: bool = DEFAULT_FIX_QUESTION_INTONATION
     speed: float = DEFAULT_SPEED
     fp16: bool = DEFAULT_FP16
     load_jit: bool = False
@@ -265,6 +266,10 @@ class JobStore:
             "voice": request.voice,
             "response_format": request.response_format,
             "mode": request.mode or DEFAULT_MODE,
+            "seed": request.seed,
+            "temperature": request.temperature,
+            "top_p": request.top_p,
+            "top_k": request.top_k,
             "input_characters": len(request.input),
             "input_words": len(request.input.split()),
             "estimated_speech_seconds": estimate_audio_duration_seconds(request.input, request.speed or DEFAULT_SPEED),
@@ -295,7 +300,10 @@ class JobStore:
             "text_frontend": request.text_frontend,
             "speed": request.speed,
             "stream": request.stream,
-            "fix_question_intonation": request.fix_question_intonation,
+            "seed": request.seed,
+            "temperature": request.temperature,
+            "top_p": request.top_p,
+            "top_k": request.top_k,
             "instructions": request.instructions,
             "instruct_text": request.instruct_text,
             "reference_text": request.reference_text,
@@ -715,15 +723,10 @@ class SynthesisWorker:
         return json.loads(request_path.read_text(encoding="utf-8"))
 
     def _build_job_synthesis_options(self, payload: dict[str, Any]) -> CosyVoiceSynthesisOptions:
-        fix_question_intonation = _pick_override(
-            payload.get("fix_question_intonation"),
-            self.settings.fix_question_intonation,
-        )
         instruct_text = build_runtime_instruction_text(
             text=str(payload.get("input") or ""),
             instruct_text=payload.get("instruct_text"),
             instructions=payload.get("instructions"),
-            fix_question_intonation=bool(fix_question_intonation),
         )
         requested_mode = str(payload.get("mode") or self.settings.mode)
         return CosyVoiceSynthesisOptions(
@@ -732,12 +735,14 @@ class SynthesisWorker:
                 text=str(payload.get("input") or ""),
                 instruct_text=payload.get("instruct_text"),
                 instructions=payload.get("instructions"),
-                fix_question_intonation=bool(fix_question_intonation),
             ),
             requested_mode=requested_mode,
             text_frontend=_pick_override(payload.get("text_frontend"), self.settings.text_frontend),
             speed=float(_pick_override(payload.get("speed"), self.settings.speed)),
-            fix_question_intonation=bool(fix_question_intonation),
+            seed=payload.get("seed"),
+            temperature=payload.get("temperature"),
+            top_p=payload.get("top_p"),
+            top_k=payload.get("top_k"),
             instruct_text=instruct_text,
             stream=bool(payload.get("stream")),
         )
@@ -1000,11 +1005,6 @@ def parse_args(argv: list[str] | None = None) -> ServerSettings:
         choices=("on", "off"),
         default="on" if DEFAULT_TEXT_FRONTEND else "off",
     )
-    parser.add_argument(
-        "--fix-question-intonation",
-        choices=("on", "off"),
-        default="on" if DEFAULT_FIX_QUESTION_INTONATION else "off",
-    )
     parser.add_argument("--speed", type=float, default=DEFAULT_SPEED)
     parser.add_argument("--fp16", choices=("on", "off"), default="on" if DEFAULT_FP16 else "off")
     parser.add_argument("--load-jit", choices=("on", "off"), default="off")
@@ -1029,7 +1029,6 @@ def parse_args(argv: list[str] | None = None) -> ServerSettings:
         model_dir=resolve_model_dir(args.model_dir),
         mode=args.mode,
         text_frontend=parse_on_off(args.text_frontend),
-        fix_question_intonation=parse_on_off(args.fix_question_intonation),
         speed=args.speed,
         fp16=parse_on_off(args.fp16),
         load_jit=parse_on_off(args.load_jit),
@@ -1098,7 +1097,6 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
             "cached_voices": voices.count(),
             "mode": server_settings.mode,
             "text_frontend": server_settings.text_frontend,
-            "fix_question_intonation": server_settings.fix_question_intonation,
             "speed": server_settings.speed,
             "fp16": server_settings.fp16,
             "job_retention_hours": server_settings.job_retention_hours,
@@ -1239,27 +1237,19 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
                 text=request.input.strip(),
                 instruct_text=request.instruct_text,
                 instructions=request.instructions,
-                fix_question_intonation=_pick_override(
-                    request.fix_question_intonation,
-                    server_settings.fix_question_intonation,
-                ),
             ),
             text_frontend=_pick_override(request.text_frontend, server_settings.text_frontend),
             speed=_pick_override(request.speed, server_settings.speed),
             stream=bool(request.stream),
-            fix_question_intonation=_pick_override(
-                request.fix_question_intonation,
-                server_settings.fix_question_intonation,
-            ),
+            seed=request.seed,
+            temperature=request.temperature,
+            top_p=request.top_p,
+            top_k=request.top_k,
             instructions=(request.instructions or "").strip() or None,
             instruct_text=build_runtime_instruction_text(
                 text=request.input.strip(),
                 instruct_text=request.instruct_text,
                 instructions=request.instructions,
-                fix_question_intonation=_pick_override(
-                    request.fix_question_intonation,
-                    server_settings.fix_question_intonation,
-                ),
             ),
             reference_audio_base64=request.reference_audio_base64,
             reference_audio_filename=request.reference_audio_filename,
@@ -1311,27 +1301,19 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
                 text=request.input.strip(),
                 instruct_text=request.instruct_text,
                 instructions=request.instructions,
-                fix_question_intonation=_pick_override(
-                    request.fix_question_intonation,
-                    server_settings.fix_question_intonation,
-                ),
             ),
             "text_frontend": _pick_override(request.text_frontend, server_settings.text_frontend),
-            "fix_question_intonation": _pick_override(
-                request.fix_question_intonation,
-                server_settings.fix_question_intonation,
-            ),
             "speed": _pick_override(request.speed, server_settings.speed),
             "stream": bool(request.stream),
+            "seed": request.seed,
+            "temperature": request.temperature,
+            "top_p": request.top_p,
+            "top_k": request.top_k,
             "instructions": (request.instructions or "").strip() or None,
             "instruct_text": build_runtime_instruction_text(
                 text=request.input.strip(),
                 instruct_text=request.instruct_text,
                 instructions=request.instructions,
-                fix_question_intonation=_pick_override(
-                    request.fix_question_intonation,
-                    server_settings.fix_question_intonation,
-                ),
             ),
             "reference_text": (request.reference_text or "").strip() or None,
             "force_rebuild_voice": bool(request.force_rebuild_voice),
@@ -1532,7 +1514,10 @@ def build_request_payload(request: "CreateTTSJobRequest") -> dict[str, Any]:
         "text_frontend": request.text_frontend,
         "speed": request.speed,
         "stream": request.stream,
-        "fix_question_intonation": request.fix_question_intonation,
+        "seed": request.seed,
+        "temperature": request.temperature,
+        "top_p": request.top_p,
+        "top_k": request.top_k,
         "instructions": request.instructions,
         "instruct_text": request.instruct_text,
         "reference_text": request.reference_text,

@@ -62,7 +62,6 @@ if "pydantic" not in sys.modules:
 if "cosyvoice_win.cli" not in sys.modules:
     fake_cli = types.SimpleNamespace(
         DEFAULT_FP16=True,
-        DEFAULT_FIX_QUESTION_INTONATION=False,
         DEFAULT_MODEL_DIR=FAKE_PROJECT_ROOT / "pretrained_models" / "CosyVoice2-0.5B",
         DEFAULT_MODEL_ID="CosyVoice2-0.5B",
         DEFAULT_MODE="zero_shot",
@@ -113,7 +112,10 @@ class DummyRequest:
         text_frontend: bool | None = None,
         speed: float | None = None,
         stream: bool | None = None,
-        fix_question_intonation: bool | None = None,
+        seed: int | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        top_k: int | None = None,
         instructions: str | None = None,
         instruct_text: str | None = None,
         reference_audio_base64: str | None = None,
@@ -130,7 +132,10 @@ class DummyRequest:
         self.text_frontend = text_frontend
         self.speed = speed
         self.stream = stream
-        self.fix_question_intonation = fix_question_intonation
+        self.seed = seed
+        self.temperature = temperature
+        self.top_p = top_p
+        self.top_k = top_k
         self.instructions = instructions
         self.instruct_text = instruct_text
         self.reference_audio_base64 = reference_audio_base64
@@ -184,6 +189,10 @@ class TestJobStoreCleanup(unittest.TestCase):
                     mode="zero_shot",
                     text_frontend=False,
                     speed=1.0,
+                    seed=123,
+                    temperature=0.85,
+                    top_p=0.75,
+                    top_k=20,
                     reference_text="exact transcript",
                 )
             )
@@ -193,6 +202,10 @@ class TestJobStoreCleanup(unittest.TestCase):
 
             self.assertIn('"voice": "reference_long"', payload)
             self.assertIn('"mode": "zero_shot"', payload)
+            self.assertIn('"seed": 123', payload)
+            self.assertIn('"temperature": 0.85', payload)
+            self.assertIn('"top_p": 0.75', payload)
+            self.assertIn('"top_k": 20', payload)
             self.assertIn('"reference_text": "exact transcript"', payload)
 
 
@@ -326,11 +339,24 @@ class TestBuildRequestPayload(unittest.TestCase):
         from cosyvoice_win.server import build_request_payload
 
         payload = build_request_payload(
-            DummyRequest(input="hello", voice="narrator", mode="zero_shot", reference_text="exact")
+            DummyRequest(
+                input="hello",
+                voice="narrator",
+                mode="zero_shot",
+                seed=321,
+                temperature=0.9,
+                top_p=0.8,
+                top_k=25,
+                reference_text="exact",
+            )
         )
         self.assertEqual(payload["input"], "hello")
         self.assertEqual(payload["voice"], "narrator")
         self.assertEqual(payload["mode"], "zero_shot")
+        self.assertEqual(payload["seed"], 321)
+        self.assertEqual(payload["temperature"], 0.9)
+        self.assertEqual(payload["top_p"], 0.8)
+        self.assertEqual(payload["top_k"], 25)
         self.assertEqual(payload["reference_text"], "exact")
         self.assertEqual(payload["metadata"], {})
 
